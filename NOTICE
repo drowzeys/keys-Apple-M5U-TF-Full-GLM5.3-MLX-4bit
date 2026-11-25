@@ -1,0 +1,23 @@
+keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit
+Modified copy of TensorFold (https://github.com/ashhart/TensorFold) at upstream
+commit d30325dcb5422d3981ab6de6633e2ae0af6ad17e (version 1.3.4).
+
+Changes made by this repository's author (drowzeys), 2026, are listed in
+MODIFICATIONS.md. In short: a new model family `glm_ax` (full GLM-5.3 on MLX
+4-bit weights, Metal), its registration in four upstream files, one dispatch-size
+fix in the GLM DSA indexer, upstream's README moved to README-TensorFold.md,
+benchmark scripts and an MTP-head merge script under glm53/. The glm_ax Metal kernels were derived from TensorFold's own GLM-5.3-Flash
+kernels (glm_sparse_nax, glm_index_nax and their split/combine decode path) and
+build on TensorFold's core row-projection, affine matmul and MoE routing code.
+These changes are released under the same Apache License, Version 2.0.
+
+-------------------------------------------------------------------------------
+
+TensorFold
+Copyright 2026 TensorFold contributors
+https://github.com/ashhart/TensorFold
+
+TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+THIRD_PARTY_NOTICES.md.
