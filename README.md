@@ -130,7 +130,14 @@ The server is `zig-out/native/bin/tensorfold-native`. `zig build` defaults to th
 Metal kernels are compiled from embedded sources when the model loads. `zig build tf-glm-ax-run` builds the
 server-less runner.
 
-A prebuilt macOS arm64 binary of this exact source is attached to the repository's GitHub release.
+### Prebuilt binary
+
+The [v0.1.0-glm53-mtp release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp)
+has `tensorfold-native` built from this source (`zig build native`, fast mode, Xcode 27.2 Metal toolchain) as a
+.tar.gz with its SHA-256, plus the licence files. It needs macOS 27.2.1 or later (the SDK it was built with). It is
+ad-hoc signed, not notarized: after downloading, run `xattr -d com.apple.quarantine tensorfold-native`. No weights
+are included. The binary is a rebuild of the measured source with the defaults described above, not the exact file
+that produced the benchmark numbers.
 
 ## Serve
 
