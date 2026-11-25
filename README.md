@@ -192,8 +192,26 @@ depth was found at each length:
 | 255,439 tokens | 478.4 s | 534 tok/s | 431.5 GiB |
 
 Peak wired memory was 431.7 GiB; the compressor stayed flat at 0.71 GiB, free memory never went below 60.9 GiB,
-and the whole machine stayed under 500 GB. Decode speed at 128k and 256k has not been measured yet: the needle
-replies were only about 10 tokens.
+and the whole machine stayed under 500 GB.
+
+#### Decode at long context
+
+Same binary and flags (`GLM_AX_LOAD_LIMIT_GB=470`, `--context 262144`, `--parallel 1`), prompt cache 16 GiB,
+400-token answers, tok/s:
+
+| Context | Drafts | Prose, T=0.6 | Prose, greedy | Code, greedy |
+|---:|---|---:|---:|---:|
+| 127.5k | MTP depth 1 (`GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off`) | 26.0 | 25.2 | 28.0 |
+| 127.5k | built-in default (depth 2 + cut 0.7) | 24.4 | 25.2 | 30.9 |
+| 254.7k | MTP depth 1 | 21.3 | 20.9 | not run |
+| 254.7k | built-in default | 20.3 | 20.8 | not run |
+
+- First token: 205 s at 127.5k (622 tok/s), 476 s at 254.7k (535 tok/s). Peak wired memory during this run
+  431.7 GiB, compressor 0.71 GiB.
+- The 2-token verify pass grows from about 46 ms at short context to about 65 ms at 128k and 79 ms at 256k, about
+  0.13 ms per 1,000 tokens of context, from the DSA indexer's per-row scoring and top-k.
+- At long context, use depth 1 for prose and the built-in default for code.
+- Code decode at 256k has not been measured.
 
 ## Get the weights
 
@@ -304,9 +322,9 @@ The scripts use only the Python standard library.
 ## Limitations
 
 - Single stream only (`--parallel 1`).
-- Decode speed was measured through the server up to about 21k tokens of context; answers (needles), memory and
-  prompt rate up to about 255k tokens. Decode speed at 128k and 256k has not been measured yet. Contexts beyond
-  256k were not tried.
+- Answers (needles), memory, prompt rate and decode were measured up to about 255k tokens of context; code decode
+  at 256k was not run. Contexts beyond 256k were not tried. Decode slows with context (about 26 tok/s for prose at
+  128k, 21 at 256k).
 - Not bit-identical to MLX (summation order), see above.
 - The DFlash2 drafter path is in the code but not benchmarked for this README; the DSpark row comes from an
   earlier build (tf32).
