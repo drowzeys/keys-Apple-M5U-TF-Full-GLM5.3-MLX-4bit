@@ -34,7 +34,8 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 
 | Build | Drafts | Prose, T=0.6 | Prose, greedy | Code, greedy | Edit, greedy |
 |---|---|---:|---:|---:|---:|
-| this source (tf16) | MTP, depth 1 | **35.8** | **37.1** | **39.3** | **34.0** |
+| released binary (v0.1.0, published defaults) | MTP, depth 1 | **36.3** | **37.4** | **40.2** | **35.1** |
+| this source (tf16) as benchmarked (fused unembed on) | MTP, depth 1 | 35.8 | 37.1 | 39.3 | 34.0 |
 | previous build (tf15) | MTP, depth 1 | 35.4 | 37.3 | 39.5 | 33.7 |
 | previous build (tf15) | none | 29.4 | 30.0 | 29.9 | - |
 
@@ -43,6 +44,8 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
   GPU against about 33 ms for a plain 1-row step; the MTP draft pass about 1.2 ms.
 - MTP at about 16k tokens of context (tf15): prose 33.3 tok/s at T=0.6, 33.5 greedy.
 - First token on a short prompt: 0.30-0.35 s (0.85 s for the edit prompt).
+- The released binary's run: verify pass 44.8-47.1 ms on the GPU; first-position draft acceptance 76% for prose
+  at T=0.6 and 93% greedy.
 - Earlier builds measured depth 1 a little ahead of depths 2 and 3 for prose (32.5 / 31.8 / 31.3 tok/s on one
   older build), so depth 1 is the recommended setting; deeper drafts helped edits on older builds.
 
@@ -71,6 +74,9 @@ Whole decode step without the server (`tf-glm-ax-run`, tf16): 33.9 ms on the GPU
   a 24-token prompt, min 0.99998. The published build's decode row (8 layers, position 3,226) matches that checked
   build at cosine 0.999995.
 - The fused decode paths (absorb + rope, unembed) are bit-identical to the unfused ones.
+- The released v0.1.0 binary was itself run on the model after publishing: its SHA-256 matched, the Canberra check
+  passed, a greedy essay with MTP drafts was byte-identical to the same request without drafts, and a needle at 90%
+  depth of a 21,125-token prompt was found (first answer after 38.8 s).
 
 The output is not bit-identical to MLX: the kernels sum in a different order (fp32 sums of exact bf16 products).
 
@@ -78,8 +84,9 @@ The output is not bit-identical to MLX: the kernels sum in a different order (fp
 
 This repository is the `tf16` source tree. It was benchmarked with the fused unembed path switched on; afterwards
 that path was put behind `GLM_AX_FUSE_UNEMBED=1` (off by default) because it was about 0.5 ms a step slower and
-bit-identical. The default build published here (absorb fusion on, fused unembed off, fused MoE off, residency set
-off) was not re-benchmarked as a whole; to run exactly the measured configuration set `GLM_AX_FUSE_UNEMBED=1`.
+bit-identical. The defaults published here (absorb fusion on, fused unembed off, fused MoE off, residency set off)
+were then measured with the released binary (first row of the decode table). Set `GLM_AX_FUSE_UNEMBED=1` to get the
+earlier benchmarked configuration.
 
 ## Memory
 
@@ -136,8 +143,8 @@ The [v0.1.0-glm53-mtp release](https://github.com/drowzeys/keys-Apple-M5U-TF-Ful
 has `tensorfold-native` built from this source (`zig build native`, fast mode, Xcode 27.2 Metal toolchain) as a
 .tar.gz with its SHA-256, plus the licence files. It needs macOS 27.2.1 or later (the SDK it was built with). It is
 ad-hoc signed, not notarized: after downloading, run `xattr -d com.apple.quarantine tensorfold-native`. No weights
-are included. The binary is a rebuild of the measured source with the defaults described above, not the exact file
-that produced the benchmark numbers.
+are included. This exact binary was run on the model after publishing (see Results: decode table and correctness
+checks).
 
 ## Serve
 
