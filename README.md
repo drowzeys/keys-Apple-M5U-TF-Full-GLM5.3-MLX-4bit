@@ -14,8 +14,8 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 - MTP drafts plus context-copy drafts, verified in one pass, through TensorFold's OpenAI-compatible server. The
   default is two MTP drafts with a confidence cut (best for code and edits); prose is best at one draft. Opt-in:
   the DFlash2 and DSpark drafters.
-- One stream at a time (`--parallel 1`); served and checked up to about 21k tokens of context, prompt rate measured
-  to 78k.
+- One stream at a time (`--parallel 1`); served and checked up to about 77k tokens of context (78k with the load
+  limit used here).
 
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
@@ -128,7 +128,27 @@ The output is not bit-identical to MLX: the kernels sum in a different order (fp
 
 ## Memory
 
-- Weights: 389.6 GiB without the MTP head, 394.8 GiB with it. Caches for 32k context: 11-17 GiB.
+**Peak wired memory 415 GiB at a 77k-token prompt (78k context, `GLM_AX_LOAD_LIMIT_GB=440`); needs about 420 GB of
+free unified memory and a raised GPU wired limit.**
+
+Measured on v0.2.1 (tf39, built-in MTP default, `--context 78000 --prompt-cache-gib 0`, 8192-row prompt chunks),
+sampling `vm_stat` every second:
+
+| Point | Wired |
+|---|---:|
+| after load (394.8 GiB weights incl. the MTP head + 7.1 GiB caches for 78k context) | 408.4 GiB |
+| after a 71,144-token prompt | 414.5 GiB |
+| after a 76,687-token prompt | 409.6 GiB |
+| peak | 415.3 GiB |
+
+- Prompt processing adds about 7 GiB of scratch on top of weights and caches. The compressor stayed flat at
+  0.72 GiB and free memory never went below 76.3 GiB on the 512 GB machine.
+- A needle at 50% depth was found at both lengths: 110.7 s for 71,144 tokens (about 643 tok/s) and 117.0 s for
+  76,687 tokens (about 655 tok/s), including the MTP layer's pass over the prompt.
+- The KV and index caches take about 96.6 KB a token. With `GLM_AX_LOAD_LIMIT_GB=440` the largest `--context` the
+  server accepts is 78,601 tokens; longer contexts need a higher limit, which has not been measured.
+- Weights: 389.6 GiB without the MTP head, 394.8 GiB with it. At the 32k context used for the benchmarks, the
+  caches took 11-17 GiB on earlier builds.
 - The Mac's GPU wired-memory limit has to be raised above the default, for example:
 
   ```sh
@@ -139,7 +159,7 @@ The output is not bit-identical to MLX: the kernels sum in a different order (fp
   macOS, the machine can stall or reboot. Close other large programs first, and a memory watchdog (a script that
   stops the server when free memory drops below a few GB) is recommended. The setting resets at reboot.
 - `GLM_AX_LOAD_LIMIT_GB=440` raises the engine's own load limit (default 75% of RAM, too low for this model).
-- A 512 GB Mac is required in practice. Loading takes about 40 s from a warm file cache.
+- A 512 GB Mac is required in practice (about 420 GB free for a 78k context). Loading takes about 40 s from a warm file cache.
 
 ## Get the weights
 
@@ -250,8 +270,9 @@ The scripts use only the Python standard library.
 ## Limitations
 
 - Single stream only (`--parallel 1`).
-- Decode and correctness were measured through the server up to about 21k tokens of context; the prompt rate was
-  measured to 78k tokens without the server. Decode and answers at longer contexts were not measured.
+- Decode speed was measured through the server up to about 21k tokens of context; answers (needles) and memory up
+  to about 77k tokens, prompt rate to 78k. Contexts beyond 78.6k need a load limit above 440 GB and were not
+  measured.
 - Not bit-identical to MLX (summation order), see above.
 - The DFlash2 drafter path is in the code but not benchmarked for this README; the DSpark row comes from an
   earlier build (tf32).
