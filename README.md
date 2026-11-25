@@ -45,8 +45,10 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 
 | Build | Drafts (settings) | Prose, T=0.6 | Prose, greedy | Code, greedy | Edit, greedy | Prose at ~16k context |
 |---|---|---:|---:|---:|---:|---:|
-| **v0.2.1 (tf39)** | MTP, depth 1 (`GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off`) | **36.0** | **36.9** | **39.3** | **38.3** | - |
-| **v0.2.1 (tf39)** | MTP, built-in default (depth 2 + confidence cut 0.7) | **35.5** | **36.7** | **40.2** | **41.4** | **31.8** |
+| **v0.2.1 release binary** | MTP, depth 1 (`GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off`) | **35.7** | **37.6** | **39.3** | **41.0** | - |
+| **v0.2.1 release binary** | MTP, built-in default (depth 2 + confidence cut 0.7) | **35.2** | **36.7** | **41.7** | **42.7** | - |
+| v0.2.1 source (tf39) as first benchmarked | MTP, depth 1, floor off | 36.0 | 36.9 | 39.3 | 38.3 | - |
+| v0.2.1 source (tf39) as first benchmarked | MTP, built-in default | 35.5 | 36.7 | 40.2 | 41.4 | 31.8 |
 | v0.2.0 release binary | MTP, depth 1 (`GLM_AX_DRAFT_DEPTH=1`) | 36.0 | 37.9 | 39.8 | 40.0 | - |
 | v0.2.0 release binary, option | MTP, depth 2 + confidence cut (`GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7`) | 35.7 | 38.2 | 42.4 | 42.7 | - |
 | v0.2.0 source (tf33) as first benchmarked | MTP, depth 1 | 36.5 | 36.6 | 38.6 | 38.5 | 33.0 |
@@ -57,7 +59,7 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 | tf15 | MTP, depth 1 | 35.4 | 37.3 | 39.5 | 33.7 | 33.3 |
 | tf15 | none | 29.4 | 30.0 | 29.9 | - | - |
 
-- The v0.2.0 release-binary rows are medians of 2 runs (`RUNS=2`), the others of 3.
+- The release-binary rows are medians of 2 runs (`RUNS=2`), the others of 3.
 - v0.2.1 decodes level with v0.2.0 within run-to-run noise; its gain is prompt processing.
 - At default settings v0.2.0 decodes prose level with v0.1.0 (36.5 / 36.0 against 36.3 tok/s at T=0.6) and code
   slightly lower (38.6 / 39.8 against 40.2, up to 4%); edits are faster (38.5 / 40.0 against 35.1). The gain of
@@ -73,13 +75,13 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 
 ### Prompt processing (first-token rate, prompt cache off)
 
-| Prompt | v0.2.1 (tf39), no drafts | v0.2.1 (tf39), MTP server | v0.2.0 (tf33), no drafts | v0.2.0 release binary, MTP server | same family on v1.3.5 without the prefill changes | v0.1.0 (tf16), no drafts |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1,284 tokens | **735 tok/s** (+4% / +15%) | 639 tok/s | 706 tok/s | 682 tok/s | 640 tok/s | 667 tok/s |
-| 4,941 tokens | **784 tok/s** (+9% / +39%) | 732 tok/s | 718 tok/s | 700 tok/s | 566 tok/s | 593 tok/s |
-| 19,611 tokens | **754 tok/s** (+7% / +46%) | 717 tok/s | 707 tok/s | 681 tok/s | 516 tok/s | 570 tok/s |
+| Prompt | v0.2.1 release binary, no drafts | v0.2.1 (tf39), no drafts | v0.2.1 (tf39), MTP server | v0.2.0 (tf33), no drafts | v0.2.0 release binary, MTP server | same family on v1.3.5 without the prefill changes | v0.1.0 (tf16), no drafts |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,284 tokens | **736 tok/s** | 735 tok/s (+4% / +15%) | 639 tok/s | 706 tok/s | 682 tok/s | 640 tok/s | 667 tok/s |
+| 4,941 tokens | **786 tok/s** | 784 tok/s (+9% / +39%) | 732 tok/s | 718 tok/s | 700 tok/s | 566 tok/s | 593 tok/s |
+| 19,611 tokens | **755 tok/s** | 754 tok/s (+7% / +46%) | 717 tok/s | 707 tok/s | 681 tok/s | 516 tok/s | 570 tok/s |
 
-Percentages are against v0.2.0 (no drafts) and against the v1.3.5 base column. In v0.2.1 the prompt's routed
+Percentages in the tf39 column are against v0.2.0 (no drafts) and against the v1.3.5 base column. In v0.2.1 the prompt's routed
 experts take 0.565 ms a token at 19.6k tokens, against 0.656 ms in v0.2.0 (about 80 against 69 TFLOPS, estimated). The rate is prompt tokens / time to the first token (it includes
 tokenizing and one decode pass). With the prompt cache on (the server's default), a follow-up turn of the same
 conversation started in about 0.34 s on an earlier build instead of reprocessing the whole conversation.
@@ -96,12 +98,16 @@ Whole decode step without the server (`tf-glm-ax-run`, tf16): 33.9 ms on the GPU
 
 ### Correctness checks
 
+v0.2.1 release binary (the published asset, run on the model after publishing):
+- SHA-256 matched; Canberra passed in all three server runs; a needle at 90% of a 21,125-token prompt was found
+  (29.1 s).
+- A greedy essay was byte-identical to tf39's undrafted output, at depth 1 and at the built-in default.
+
 v0.2.1 source (tf39):
 - Canberra; needles at about 6k and at 10% and 90% of about 20k tokens returned exactly; through the server, a
   needle at 90% of a 21,125-token prompt was found (29.7 s).
 - Drafted greedy output equals undrafted, at depth 1 and at the built-in default.
 - 8-layer decode-row probe at position 3,226: cosine 0.999994 against the MLX-checked milestone build.
-- The v0.2.1 release binary's own run on the model is pending.
 
 v0.2.0 release binary (the published asset, run on the model after publishing):
 - SHA-256 matched; Canberra passed; a needle at 90% of a 21,125-token prompt was found (first answer after 32.8 s).
@@ -203,8 +209,8 @@ toolchain) as a .tar.gz with its SHA-256, plus the licence files. It needs macOS
 built with). It is ad-hoc signed, not notarized: after downloading, run
 `xattr -d com.apple.quarantine tensorfold-native`. No weights are included. The
 [v0.1.0 release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp)
-and the [v0.2.0 release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill) stay available, with their sources at their tags; both of those binaries were run on the model after
-publishing.
+and the [v0.2.0 release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill) stay available, with their sources at their tags. All three release binaries were run on the model after
+publishing (see Results).
 
 ## Serve
 
