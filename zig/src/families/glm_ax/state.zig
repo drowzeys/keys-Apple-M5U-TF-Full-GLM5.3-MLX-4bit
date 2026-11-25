@@ -6,7 +6,9 @@ const cfg = @import("config.zig");
 /// Rows a decode forward takes at most: the router's launch limit; more take the prompt path (tensor-unit matmuls).
 pub const window_rows = 16;
 /// Rows a prompt chunk takes at most: each expert's weights are read once a chunk.
-pub const prompt_rows = 8192; // prompt chunks of 8192 rows: bigger expert groups (measured +6% at 4096 over 2048, +3-5% more at 8192)
+/// GLM_AX_PROMPT_ROWS (set at model load, 1024-8192, a multiple of 64): smaller chunks, less prompt scratch (long contexts)
+pub var prompt_rows: usize = prompt_rows_max;
+pub const prompt_rows_max = 8192; // prompt chunks of 8192 rows: bigger expert groups (measured +6% at 4096 over 2048, +3-5% more at 8192)
 /// Rows the indexer scores at once: its scores buffer is these rows by the context.
 pub const score_rows = 64;
 /// Rows the attention kernel takes a launch (its partial sums' buffer).
@@ -14,8 +16,16 @@ pub const attend_rows = 16;
 /// Blocks a decode row's key list splits into for the tensor-unit attention (gx_sparse_split / gx_sparse_combine).
 pub const attn_blocks = 16;
 /// A cached key: 512 latent and 64 rope dims, bf16; an index key: 128 dims, bf16.
-pub const key_bytes = 576 * 2;
-pub const index_bytes = 128 * 2;
+/// GLM_AX_K8=1 (set at model load): 8-bit caches (glm_ax.metal's GX_K8 rows: codes and half scales a 64-wide group)
+pub var k8: bool = false; // the latent cache
+pub var k8i: bool = false; // the index cache
+/// A latent cache row's bytes (576 bf16, or 576 codes and nine half scales padded to 608), an index cache row's.
+pub fn keyBytes() usize {
+    return if (k8) 608 else 576 * 2;
+}
+pub fn indexBytes() usize {
+    return if (k8i) 136 else 128 * 2;
+}
 /// The x projections' stacked row on a full layer (q_a, kv_a, wk, padded weights_proj).
 pub const proj_width = 2816;
 const splits = 16;
@@ -35,7 +45,7 @@ fn fulls(c: *const cfg.Config) usize {
 
 /// Bytes a stream of `capacity` positions holds in caches.
 pub fn cacheBytes(c: *const cfg.Config, capacity: usize) usize {
-    return @as(usize, c.vocab) * 2 + window_rows * @as(usize, c.hidden) * 4 + capacity * (stack(c) * key_bytes + fulls(c) * index_bytes);
+    return @as(usize, c.vocab) * 2 + window_rows * @as(usize, c.hidden) * 4 + capacity * (stack(c) * keyBytes() + fulls(c) * indexBytes());
 }
 
 pub const Cache = struct {
@@ -72,9 +82,9 @@ pub const Cache = struct {
         var index: usize = 0;
         for (0..stack(c)) |i| if (c.full.isSet(i)) {
             out.index_at[i] = index;
-            index += capacity * index_bytes;
+            index += capacity * indexBytes();
         };
-        out.kv = try device.buffer(stack(c) * capacity * key_bytes, mtl.ResourceOptions.private);
+        out.kv = try device.buffer(stack(c) * capacity * keyBytes(), mtl.ResourceOptions.private);
         errdefer out.kv.deinit();
         out.index = try device.buffer(@max(index, 16), mtl.ResourceOptions.private);
         errdefer out.index.deinit();
@@ -86,7 +96,7 @@ pub const Cache = struct {
 
     /// Layer `l`'s keys in `kv`.
     pub fn keys(self: *const Cache, l: usize) usize {
-        return l * self.capacity * key_bytes;
+        return l * self.capacity * keyBytes();
     }
 
     /// Full layer `l`'s index keys in `index`.

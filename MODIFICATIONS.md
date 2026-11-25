@@ -6,6 +6,7 @@ unchanged. Upstream's history is not included: each release of this repository i
 
 | Release here | Upstream base | glm_ax build |
 |---|---|---|
+| v0.3.0-glm53-1m | v1.3.5 (`02b324ae`) | tf43: `max_context` 1,048,576; 8-bit KV cache (`GLM_AX_K8`); `GLM_AX_PROMPT_ROWS`; exact parallel-scan top-k; experimental `GLM_AX_BATCH` / `GLM_AX_DUAL`; untested `GLM_AX_DECODE_NAX` |
 | v0.2.1-glm53-prefill | v1.3.5 (`02b324ae`) | tf39: 8192-row prompt chunks, fused gate/up/SwiGLU prompt experts; MTP default depth 2 + cut 0.7 |
 | v0.2.0-glm53-prefill | v1.3.5 (`02b324ae`) | tf33: prefill changes, DFlash2/DSpark/confidence cut opt-in |
 | v0.1.0-glm53-mtp | `d30325dc` (1.3.4) | tf16 |
@@ -28,6 +29,7 @@ unchanged. Upstream's history is not included: each release of this repository i
 | `zig/tests/glm_ax_drawcheck.zig` | `tf-glm-ax-drawcheck`: the bounded sampler against the general one, CPU only |
 | `glm53/bench/` | The client-side benchmark scripts used for the numbers in README.md |
 | `glm53/tools/merge_mtp_head.py` | Builds the model folder with the MTP head next to the 4-bit pack (symlinks, no copy) |
+| `oneshot.sh` | One-shot setup and start script for macOS (checks, binary download with SHA-256, weights, MTP merge, server presets) |
 | `README.md`, `MODIFICATIONS.md` | This repository's documentation |
 
 ### Where the code comes from
@@ -52,6 +54,23 @@ unchanged. Upstream's history is not included: each release of this repository i
   column-group kernels; it is experimental and currently gives wrong output with glm_ax.
 - The model's math (MLA with weight absorption, the DSA indexer, sigmoid routing with the correction bias, the MTP
   block) follows the published GLM-5.3 architecture.
+
+## Changes in v0.3.0 (tf43 against v0.2.1's tf39)
+
+All in glm_ax files (`config.zig`, `model.zig`, `state.zig`, `forward.zig`, `backend.zig`, `snapshot.zig`,
+`dspark.zig`, `native/glm_ax.zig`, `glm_ax.metal`, `glm_ax_sparse.metal`, `glm_ax_mpp.metal`, `tests/glm_ax_run.zig`);
+no upstream file changed since v0.2.0.
+
+- `config.max_context` 262,144 -> 1,048,576 (the checkpoint's `max_position_embeddings`; no rope scaling).
+- 8-bit KV cache, opt-in `GLM_AX_K8=1` (`lat` / `idx` for one cache only): the MLA latent cache as 576 int8 codes +
+  9 half scales a row (8 x 64 latent groups + 1 group for the 64 roped dims, quantised after the rope), the indexer
+  keys as 128 int8 codes + 2 half scales; the decode, prompt (`glm_ax_mpp.metal`) and indexer kernels read it.
+- `GLM_AX_PROMPT_ROWS` (1024-8192, default 8192) sets the prompt chunk and its scratch.
+- The DSA indexer's top-k is an exact parallel scan (bit-identical output, measured 17% faster at 78k).
+- Experimental: `GLM_AX_BATCH=1` (batched verify of several streams), `GLM_AX_DUAL=1` (per-stream choice between
+  DSpark and MTP drafts). Untested: `GLM_AX_DECODE_NAX=1`.
+- Prompt-cache snapshots size themselves from the cache's row bytes (bf16 or 8-bit); `dspark.zig` gains the
+  `GLM_AX_DUAL` per-stream mode. No third-party code was added in v0.3.0.
 
 ## Changed upstream files
 

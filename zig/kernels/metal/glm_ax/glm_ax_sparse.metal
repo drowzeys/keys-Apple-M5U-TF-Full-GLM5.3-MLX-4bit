@@ -13,6 +13,45 @@ using namespace tfp;
 constant constexpr int HEADS = GLM_HEADS, RANK = 512, KS = 576, GROUP = 16, BLOCK = 32, SLICE = RANK / 4;
 constant constexpr float NO_SCORE = -3.4028234663852886e38f;
 
+// The caches' rows (GLM_AX_K8=1 builds these with GX_K8): the latent cache's are bf16 [576] (512 latent, 64 roped),
+// or 8-bit codes [576] then nine half scales (the eight 64-wide latent groups, the roped 64), 608 bytes; the index
+// cache's are bf16 [128], or 8-bit codes [128] then two half scales (its two 64-wide halves), 136 bytes. Codes are
+// round(v / scale), scale = the group's largest |v| / 127 (as a half).
+#ifndef GX_KACCESS
+#define GX_KACCESS
+// GX_K8: the latent cache 8-bit; GX_K8I: the index cache 8-bit (each on its own, GLM_AX_K8=lat / idx / 1 for both)
+#ifdef GX_K8
+typedef uchar gx_kt;
+constant constexpr long GX_KROW = 608;
+inline float gx_ks(const device gx_kt* row, int d) { return float(((const device half*)(row + 576))[d >> 6]); }
+inline bfloat gx_kget(const device gx_kt* keys, long r, int d) {
+  const device gx_kt* row = keys + r * GX_KROW;
+  return bfloat(float(as_type<char>(row[d])) * gx_ks(row, d));
+}
+inline bfloat4 gx_kget4(const device gx_kt* keys, long r, int d) {
+  const device gx_kt* row = keys + r * GX_KROW;
+  return bfloat4(float4(*(const device char4*)(row + d)) * gx_ks(row, d));
+}
+#else
+typedef bfloat gx_kt;
+constant constexpr long GX_KROW = 576;
+inline bfloat gx_kget(const device gx_kt* keys, long r, int d) { return keys[r * 576 + d]; }
+inline bfloat4 gx_kget4(const device gx_kt* keys, long r, int d) { return *(const device bfloat4*)(keys + r * 576 + d); }
+#endif
+#ifdef GX_K8I
+typedef uchar gx_it;
+constant constexpr long GX_IROW = 136;
+inline float gx_iget(const device gx_it* row, uint i) { return float(as_type<char>(row[i])) * float(((const device half*)(row + 128))[i >> 6]); }
+#else
+typedef bfloat gx_it;
+constant constexpr long GX_IROW = 128;
+inline float gx_iget(const device gx_it* row, uint i) { return float(row[i]); }
+#endif
+// A group's 8-bit scale from its largest |v| (a half), and v's code under it.
+inline half gx_qscale(float amax) { return half(amax / 127.0f); }
+inline char gx_qcode(float v, half s) { return float(s) > 0.0f ? char(clamp(rint(v / float(s)), -127.0f, 127.0f)) : char(0); }
+#endif
+
 // A transposed right operand's element e: the row it comes from (here a key) and its column (a latent dim).
 #ifndef TF_SIMD_FRAGS
 inline short t_key(short e, short2 home) { return home.y + (e >> 2) * 8; }
@@ -44,7 +83,7 @@ inline void sparse_queries(thread frag<bfloat> (&q)[9], const device bfloat* qro
 
 // One row's entries [lo, hi) (an entry outside [0, key_length) is no key): scores, online softmax, values into `acc`.
 inline void sparse_pass(thread frag<float> (&acc)[4][2], thread float (&m)[2], thread float (&l)[2], thread const frag<bfloat> (&q)[9],
-                        const device bfloat* keys, const device int32_t* list, int lo, int hi, int key_length, float scale,
+                        const device gx_kt* keys, const device int32_t* list, int lo, int hi, int key_length, float scale,
                         threadgroup float (&partial)[4][32][16], threadgroup int (&keyrow)[BLOCK], uint s, uint lane, short2 home, int d0) {
   for (int j0 = lo; j0 < hi; j0 += BLOCK) {
     if (s == 0) {
@@ -57,20 +96,21 @@ inline void sparse_pass(thread frag<float> (&acc)[4][2], thread float (&m)[2], t
     frag<float> lo_s = frag<float>(0), hi_s = frag<float>(0);
 #ifndef TF_SIMD_FRAGS
     // a lane's four dims of each of its four keys, 8 bytes a load
-    const device bfloat* kr[4];
+    long kr[4];
     TF_UNROLL
-    for (short i = 0; i < 4; i++) kr[i] = keys + long(max(keyrow[8 * i + home.y], 0)) * KS + d0 + home.x;
+    for (short i = 0; i < 4; i++) kr[i] = long(max(keyrow[8 * i + home.y], 0));
+    const int dl = d0 + home.x;
     TF_UNROLL
     for (short t = 0; t < 8; t++) {
-      const frag<bfloat> b0 = frag<bfloat>(*(const device bfloat4*)(kr[0] + 16 * t), *(const device bfloat4*)(kr[1] + 16 * t));
-      const frag<bfloat> b1 = frag<bfloat>(*(const device bfloat4*)(kr[2] + 16 * t), *(const device bfloat4*)(kr[3] + 16 * t));
+      const frag<bfloat> b0 = frag<bfloat>(gx_kget4(keys, kr[0], dl + 16 * t), gx_kget4(keys, kr[1], dl + 16 * t));
+      const frag<bfloat> b1 = frag<bfloat>(gx_kget4(keys, kr[2], dl + 16 * t), gx_kget4(keys, kr[3], dl + 16 * t));
       mma_16x32<false, true>(lo_s, hi_s, q[t], b0, b1);
     }
     {
       // the rope part: this simdgroup's 16 of the 64 roped dims
-      const int r = RANK + 16 * int(s) - d0;
-      const frag<bfloat> b0 = frag<bfloat>(*(const device bfloat4*)(kr[0] + r), *(const device bfloat4*)(kr[1] + r));
-      const frag<bfloat> b1 = frag<bfloat>(*(const device bfloat4*)(kr[2] + r), *(const device bfloat4*)(kr[3] + r));
+      const int r = RANK + 16 * int(s) + home.x;
+      const frag<bfloat> b0 = frag<bfloat>(gx_kget4(keys, kr[0], r), gx_kget4(keys, kr[1], r));
+      const frag<bfloat> b1 = frag<bfloat>(gx_kget4(keys, kr[2], r), gx_kget4(keys, kr[3], r));
       mma_16x32<false, true>(lo_s, hi_s, q[8], b0, b1);
     }
 #else
@@ -81,8 +121,8 @@ inline void sparse_pass(thread frag<float> (&acc)[4][2], thread float (&m)[2], t
       for (short e = 0; e < 8; e++) {
         const int k0 = keyrow[t_key(e, home)], k1 = keyrow[16 + t_key(e, home)];
         const int d = d0 + 16 * t + t_dim(e, home);
-        b0[e] = keys[long(max(k0, 0)) * KS + d];
-        b1[e] = keys[long(max(k1, 0)) * KS + d];
+        b0[e] = gx_kget(keys, long(max(k0, 0)), d);
+        b1[e] = gx_kget(keys, long(max(k1, 0)), d);
       }
       mma_16x32<false, true>(lo_s, hi_s, q[t], b0, b1);
     }
@@ -92,8 +132,8 @@ inline void sparse_pass(thread frag<float> (&acc)[4][2], thread float (&m)[2], t
       for (short e = 0; e < 8; e++) {
         const int k0 = keyrow[t_key(e, home)], k1 = keyrow[16 + t_key(e, home)];
         const int d = RANK + 16 * int(s) + t_dim(e, home);
-        b0[e] = keys[long(max(k0, 0)) * KS + d];
-        b1[e] = keys[long(max(k1, 0)) * KS + d];
+        b0[e] = gx_kget(keys, long(max(k0, 0)), d);
+        b1[e] = gx_kget(keys, long(max(k1, 0)), d);
       }
       mma_16x32<false, true>(lo_s, hi_s, q[8], b0, b1);
     }
@@ -152,22 +192,22 @@ inline void sparse_pass(thread frag<float> (&acc)[4][2], thread float (&m)[2], t
     TF_UNROLL
     for (short kb = 0; kb < 2; kb++) {
 #ifndef TF_SIMD_FRAGS
-      const device bfloat* va = keys + long(max(keyrow[16 * kb + home.y], 0)) * KS + d0 + home.x;
-      const device bfloat* vb = keys + long(max(keyrow[16 * kb + home.y + 8], 0)) * KS + d0 + home.x;
+      const long va = long(max(keyrow[16 * kb + home.y], 0)), vb = long(max(keyrow[16 * kb + home.y + 8], 0));
+      const int vd = d0 + home.x;
 #endif
       TF_UNROLL
       for (short c = 0; c < 4; c++) {
         frag<bfloat> v0, v1;
 #ifndef TF_SIMD_FRAGS
-        v0 = frag<bfloat>(*(const device bfloat4*)(va + 32 * c), *(const device bfloat4*)(vb + 32 * c));
-        v1 = frag<bfloat>(*(const device bfloat4*)(va + 32 * c + 16), *(const device bfloat4*)(vb + 32 * c + 16));
+        v0 = frag<bfloat>(gx_kget4(keys, va, vd + 32 * c), gx_kget4(keys, vb, vd + 32 * c));
+        v1 = frag<bfloat>(gx_kget4(keys, va, vd + 32 * c + 16), gx_kget4(keys, vb, vd + 32 * c + 16));
 #else
         TF_UNROLL
         for (short e = 0; e < 8; e++) {
           const int k = max(keyrow[16 * kb + p_row(e, home)], 0);
           const int d = d0 + 32 * c + p_col(e, home);
-          v0[e] = keys[long(k) * KS + d];
-          v1[e] = keys[long(k) * KS + d + 16];
+          v0[e] = gx_kget(keys, long(k), d);
+          v1[e] = gx_kget(keys, long(k), d + 16);
         }
 #endif
         TF_UNROLL
@@ -197,7 +237,7 @@ inline void sparse_clear(thread frag<float> (&acc)[4][2], thread float (&m)[2], 
 
 // out [rows, 64, 512] over rows' `width` keys (an entry outside [0, key_length) is no key); grid (4 head groups, rows).
 // meta: (width, key_length, position of row 0, -); ql [rows, 64, 576].
-[[kernel]] void gx_sparse_nax(const device bfloat* ql [[buffer(0)]], const device bfloat* keys [[buffer(1)]],
+[[kernel]] void gx_sparse_nax(const device bfloat* ql [[buffer(0)]], const device gx_kt* keys [[buffer(1)]],
                                const device int32_t* indices [[buffer(2)]], constant float& scale [[buffer(3)]],
                                constant int4& meta [[buffer(4)]], device bfloat* out [[buffer(5)]],
                                uint s [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
@@ -255,7 +295,7 @@ inline frag<bfloat> gx_ix_frag(const device bfloat* r0, const device bfloat* r1,
 
 // Grid (64-key tiles, 16-row tiles of the block / simdgroups): a threadgroup of sgs simdgroups, 16 rows each.
 [[kernel]] void gx_index_nax(const device bfloat* iq [[buffer(0)]], const device bfloat* iw [[buffer(1)]],
-                             const device bfloat* keys [[buffer(2)]], device float* scores [[buffer(3)]],
+                             const device gx_it* keys [[buffer(2)]], device float* scores [[buffer(3)]],
                              constant gx_score_args& a [[buffer(4)]], uint sg [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]], uint3 tg [[threadgroup_position_in_grid]],
                              uint sgs [[simdgroups_per_threadgroup]]) {
@@ -270,7 +310,16 @@ inline frag<bfloat> gx_ix_frag(const device bfloat* r0, const device bfloat* r1,
   for (uint i = t; i < 64 * (IX_DIM / 8); i += 32 * sgs) { // the 64 keys, 16 bytes a load (past the last: the last)
     const uint rr = i / (IX_DIM / 8), cc = (i % (IX_DIM / 8)) * 8;
     const int b = min(b0 + int(rr), last);
+#ifdef GX_K8I
+    const device gx_it* krow = keys + size_t(b) * GX_IROW;
+    const float ksc = float(((const device half*)(krow + IX_DIM))[cc >> 6]);
+    const float4 lo4 = float4(*(const device char4*)(krow + cc)) * ksc, hi4 = float4(*(const device char4*)(krow + cc + 4)) * ksc;
+    threadgroup bfloat* dst = tile + rr * IX_PAD + cc;
+    *(threadgroup bfloat4*)(dst) = bfloat4(lo4);
+    *(threadgroup bfloat4*)(dst + 4) = bfloat4(hi4);
+#else
     *(threadgroup uint4*)(tile + rr * IX_PAD + cc) = *(const device uint4*)(keys + size_t(b) * IX_DIM + cc);
+#endif
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const short2 home = frag_home(ushort(lane));
@@ -323,7 +372,7 @@ inline frag<bfloat> gx_ix_frag(const device bfloat* r0, const device bfloat* r1,
 // Decode rows on the tensor units (glm_sparse_nax.metal's split and combine, 576-wide keys and queries): block b's
 // unnormalized `span` list entries: po [rows,blocks,64,512], max pm, sum pl [rows,blocks,64]; grid (4,blocks,rows).
 // meta: (width, key_length, span, position of row 0); a row lists min(width, its position + 1) keys.
-[[kernel]] void gx_sparse_split(const device bfloat* ql [[buffer(0)]], const device bfloat* keys [[buffer(1)]],
+[[kernel]] void gx_sparse_split(const device bfloat* ql [[buffer(0)]], const device gx_kt* keys [[buffer(1)]],
                                  const device int32_t* indices [[buffer(2)]], constant float& scale [[buffer(3)]],
                                  constant int4& meta [[buffer(4)]], device float* po [[buffer(5)]], device float* pm [[buffer(6)]],
                                  device float* pl [[buffer(7)]], uint s [[simdgroup_index_in_threadgroup]],

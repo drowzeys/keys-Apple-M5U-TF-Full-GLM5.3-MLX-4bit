@@ -14,9 +14,48 @@ using namespace mpp::tensor_ops;
 
 constant constexpr int GM_D = 576, GM_RANK = 512, GM_HEADS = 64, GM_BK = 128;
 
+// The caches' rows (GLM_AX_K8=1 builds these with GX_K8): the latent cache's are bf16 [576] (512 latent, 64 roped),
+// or 8-bit codes [576] then nine half scales (the eight 64-wide latent groups, the roped 64), 608 bytes; the index
+// cache's are bf16 [128], or 8-bit codes [128] then two half scales (its two 64-wide halves), 136 bytes. Codes are
+// round(v / scale), scale = the group's largest |v| / 127 (as a half).
+#ifndef GX_KACCESS
+#define GX_KACCESS
+// GX_K8: the latent cache 8-bit; GX_K8I: the index cache 8-bit (each on its own, GLM_AX_K8=lat / idx / 1 for both)
+#ifdef GX_K8
+typedef uchar gx_kt;
+constant constexpr long GX_KROW = 608;
+inline float gx_ks(const device gx_kt* row, int d) { return float(((const device half*)(row + 576))[d >> 6]); }
+inline bfloat gx_kget(const device gx_kt* keys, long r, int d) {
+  const device gx_kt* row = keys + r * GX_KROW;
+  return bfloat(float(as_type<char>(row[d])) * gx_ks(row, d));
+}
+inline bfloat4 gx_kget4(const device gx_kt* keys, long r, int d) {
+  const device gx_kt* row = keys + r * GX_KROW;
+  return bfloat4(float4(*(const device char4*)(row + d)) * gx_ks(row, d));
+}
+#else
+typedef bfloat gx_kt;
+constant constexpr long GX_KROW = 576;
+inline bfloat gx_kget(const device gx_kt* keys, long r, int d) { return keys[r * 576 + d]; }
+inline bfloat4 gx_kget4(const device gx_kt* keys, long r, int d) { return *(const device bfloat4*)(keys + r * 576 + d); }
+#endif
+#ifdef GX_K8I
+typedef uchar gx_it;
+constant constexpr long GX_IROW = 136;
+inline float gx_iget(const device gx_it* row, uint i) { return float(as_type<char>(row[i])) * float(((const device half*)(row + 128))[i >> 6]); }
+#else
+typedef bfloat gx_it;
+constant constexpr long GX_IROW = 128;
+inline float gx_iget(const device gx_it* row, uint i) { return float(row[i]); }
+#endif
+// A group's 8-bit scale from its largest |v| (a half), and v's code under it.
+inline half gx_qscale(float amax) { return half(amax / 127.0f); }
+inline char gx_qcode(float v, half s) { return float(s) > 0.0f ? char(clamp(rint(v / float(s)), -127.0f, 127.0f)) : char(0); }
+#endif
+
 // meta: (list width, key length, position of row 0, -): row r lists min(width, its position + 1) keys at
 // indices + r * width, entries outside [0, key length) no key. Grid (2 halves, rows), 256 threads.
-[[kernel]] void gx_sparse_mpp(device const bfloat *queries [[buffer(0)]], device const bfloat *keys [[buffer(1)]],
+[[kernel]] void gx_sparse_mpp(device const bfloat *queries [[buffer(0)]], device const gx_kt *keys [[buffer(1)]],
                               device const int *indices [[buffer(2)]], constant float &scale [[buffer(3)]],
                               constant int4 &meta [[buffer(4)]], device bfloat *out [[buffer(5)]],
                               uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -90,11 +129,11 @@ constant constexpr int GM_D = 576, GM_RANK = 512, GM_HEADS = 64, GM_BK = 128;
     auto sc = qk_op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(qa)>, metal::remove_addrspace_t<decltype(kb)>, float>();
     for (short e = 0; e < 16; ++e) sc[e] = 0.0f;
     if (j4 * 32 < tile_keys) {
-      device const bfloat *ks[2][2];
+      long ks[2][2];
       for (short tn = 0; tn < 2; ++tn)
         for (short i = 0; i < 2; ++i) {
           const int k = key_at[buf][j4 * 32 + tn * 16 + fm + i * 8];
-          ks[tn][i] = keys + long(max(k, 0)) * GM_D + fn;
+          ks[tn][i] = long(max(k, 0));
         }
       _Pragma("clang loop unroll_count(4)")
       for (short kk = 0; kk < GM_D; kk += 16) {
@@ -104,7 +143,10 @@ constant constexpr int GM_D = 576, GM_RANK = 512, GM_HEADS = 64, GM_BK = 128;
         }
         for (short tn = 0; tn < 2; ++tn)
           for (short i = 0; i < 2; ++i)
-            for (short j = 0; j < 4; ++j) kb[tn * 8 + i * 4 + j] = ks[tn][i][kk + j];
+          {
+            const bfloat4 kv4 = gx_kget4(keys, ks[tn][i], fn + kk);
+            for (short j = 0; j < 4; ++j) kb[tn * 8 + i * 4 + j] = kv4[j];
+          }
         qk_op.run(qa, kb, sc);
       }
     }
@@ -185,14 +227,14 @@ constant constexpr int GM_D = 576, GM_RANK = 512, GM_HEADS = 64, GM_BK = 128;
         pm[e] = lo[e];
       }
       const int k0 = max(key_at[buf][step * 16 + fm], 0), k1 = max(key_at[buf][step * 16 + fm + 8], 0);
-      device const bfloat *s0 = keys + long(k0) * GM_D;
-      device const bfloat *s1 = keys + long(k1) * GM_D;
+
       for (short np = 0; np < 4; ++np) {
         for (short tn = 0; tn < 2; ++tn) {
           const int at = j4 * 128 + np * 32 + tn * 16 + fn;
+          const bfloat4 a4 = gx_kget4(keys, long(k0), at), b4 = gx_kget4(keys, long(k1), at);
           for (short j = 0; j < 4; ++j) {
-            pb[tn * 8 + j] = s0[at + j];
-            pb[tn * 8 + 4 + j] = s1[at + j];
+            pb[tn * 8 + j] = a4[j];
+            pb[tn * 8 + 4 + j] = b4[j];
           }
         }
         if (np == 0) {

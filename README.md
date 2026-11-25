@@ -14,17 +14,55 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 - MTP drafts plus context-copy drafts, verified in one pass, through TensorFold's OpenAI-compatible server. The
   default is two MTP drafts with a confidence cut (best for code and edits); prose is best at one draft. Opt-in:
   the DFlash2 and DSpark drafters.
-- One stream at a time (`--parallel 1`); answers checked up to about 255k tokens of context (256k with
-  `GLM_AX_LOAD_LIMIT_GB=470`; 78k with the 440 used for the benchmarks).
+- Up to 1,048,576 tokens of context (GLM-5.3's full window) with the opt-in 8-bit KV cache: a needle was found in
+  a 1,026,813-token prompt. With the bf16 cache and MTP, up to 393,216 tokens.
+- One stream at a time (`--parallel 1`) by default.
 
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
+
+## One-shot
+
+macOS only (Apple M5-class GPU, macOS 27.2.1 or later, 512 GB unified memory). `oneshot.sh` checks the Mac,
+downloads the latest release binary and verifies its SHA-256, downloads the pinned weights with `hf download`
+(or reuses them from your Hugging Face cache), builds the MTP model folder from symlinks, offers to raise the GPU
+wired limit, starts the server and waits for a "Canberra" smoke answer.
+
+```sh
+git clone https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit.git
+cd keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit
+./oneshot.sh --preset prose --dry-run     # print every step and command, change nothing
+./oneshot.sh --preset prose               # or: code | long | 1m
+./oneshot.sh --status                     # / --stop
+```
+
+Or without cloning: download `oneshot.sh` from the [latest release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/latest)
+and run it the same way (it then fetches the merge script from the repository). Large files go under `--dir`
+(default `~/glm53-tf`); about 420 GB of disk is needed unless the 4-bit pack is already in your Hugging Face cache.
+
+| Preset | What it runs | Measured | Memory |
+|---|---|---|---|
+| `prose` | MTP depth 1, no cut, 32k context | v0.2.1: prose 35.7 tok/s (T=0.6), greedy 37.6 | peak wired about 415 GiB at 78k (less at 32k) |
+| `code` | built-in MTP default (depth 2 + 0.7 cut), 32k | v0.2.1: code 41.7 tok/s, edit 42.7 | as `prose` |
+| `long` | bf16 cache, MTP depth 1, 393,216 context, load limit 488 | 375k-token needle found, first token 784 s, decode 20.3 tok/s | peak wired 442.6 GiB |
+| `1m` | 8-bit cache, no MTP head, 1,048,576 context, load limit 495 | 1.03M-token needle found, first token 58 min, decode 7.4 tok/s | peak wired 449.1 GiB |
+| `long-mtp` | 8-bit cache with MTP, expected about 850-900k | **being measured**, not available yet | - |
+
+Safety:
+- The model wires 410-450 GiB of GPU memory. The script asks before running
+  `sudo sysctl iogpu.wired_limit_mb=500000` and never runs it silently; raising the limit is at your own risk (with
+  other large programs running, macOS can stall or reboot). Close other large programs; a memory watchdog is
+  recommended. The setting resets at reboot.
+- The binary is ad-hoc signed, not notarized; the script clears the download quarantine flag
+  (`xattr -dr com.apple.quarantine`) on the unpacked folder only.
+- The script uses no sudo except that one optional step.
 
 ## Releases
 
 | Release | Source | What changed |
 |---|---|---|
-| [v0.2.1-glm53-prefill](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.1-glm53-prefill) (this source) | tf39 on TensorFold v1.3.5 | prefill update: 8192-row prompt chunks and fused gate/up/SwiGLU for the prompt's experts (TensorFold core `affine_mm.gatherGlu`): 735-784 tok/s, +4/+9/+7% over v0.2.0 at 1.3k/4.9k/19.6k. Decode level with v0.2.0. Built-in MTP default is now depth 2 with the 0.7 confidence cut |
+| [v0.3.0-glm53-1m](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.3.0-glm53-1m) (this source) | tf43 on TensorFold v1.3.5 | 1M context: `max_context` 1,048,576; opt-in 8-bit KV cache (`GLM_AX_K8=1`); `GLM_AX_PROMPT_ROWS`; exact parallel-scan top-k (17% faster top-k at 78k, bit-identical); experimental batched verify and DSpark/MTP choice; `oneshot.sh` |
+| [v0.2.1-glm53-prefill](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.1-glm53-prefill) | tf39 on TensorFold v1.3.5 | prefill update: 8192-row prompt chunks and fused gate/up/SwiGLU for the prompt's experts (TensorFold core `affine_mm.gatherGlu`): 735-784 tok/s, +4/+9/+7% over v0.2.0 at 1.3k/4.9k/19.6k. Decode level with v0.2.0. Built-in MTP default is now depth 2 with the 0.7 confidence cut |
 | [v0.2.0-glm53-prefill](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill) | tf33 on TensorFold v1.3.5 | prefill: 4096-row prompt chunks, two-part probabilities, MetalPerformancePrimitives prompt attention; prompt processing is now flat at about 707-718 tok/s from 1.3k to 19.6k tokens. DFlash2 / DSpark / MTP confidence cut added as options |
 | [v0.1.0-glm53-mtp](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp) | tf16 on TensorFold `d30325dc` (1.3.4) | first release: full model + MTP |
 
@@ -213,6 +251,70 @@ Same binary and flags (`GLM_AX_LOAD_LIMIT_GB=470`, `--context 262144`, `--parall
 - At long context, use depth 1 for prose and the built-in default for code.
 - Code decode at 256k has not been measured.
 
+### bf16 cache up to 393k tokens (with MTP)
+
+`GLM_AX_LOAD_LIMIT_GB=488 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off`, `--context 393216 --prompt-cache-gib 0`
+(the largest bf16 context that keeps the machine under the memory rule used here), on the MTP model folder: a
+needle at 50% depth of a 375,314-token prompt was found; first token 784 s (about 479 tok/s); decode 20.3 tok/s
+with MTP depth 1; peak wired 442.6 GiB. Measured on tf42 (v0.2.1 plus the parallel top-k and the 1M
+`max_context` of v0.3.0).
+
+## 1M context (8-bit KV cache)
+
+GLM-5.3's full 1,048,576-token window fits on a 512 GB M5 Ultra with the 8-bit KV cache and without the MTP head.
+The exact command of the measured run (paths replaced):
+
+```sh
+GLM_AX_K8=1 GLM_AX_PROMPT_ROWS=2048 GLM_AX_LOAD_LIMIT_GB=495 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off \
+  ./tensorfold-native serve /path/to/GLM-5.3-4bit \
+  --name glm53 --host 127.0.0.1 --port 8020 \
+  --context 1048576 --parallel 1 --reasoning-effort low --prompt-cache-gib 0 --no-drafts --no-update-check
+```
+
+`/path/to/GLM-5.3-4bit` is the plain 4-bit pack folder (no MTP head); `--no-drafts` is required with it. The two
+`GLM_AX_DRAFT_DEPTH` / `GLM_AX_MTP_FLOOR` settings have no effect without drafts; they are kept because the run
+used them. `./oneshot.sh --preset 1m` runs exactly this.
+
+Measured (v0.3.0 source, tf43):
+
+| | |
+|---|---|
+| Prompt | 1,026,813 tokens, needle at 50% depth: found |
+| First token | 3,495 s (58.3 min, about 294 tok/s) |
+| Decode | 7.4 tok/s at 1M context (134.6 ms a step, no MTP head) |
+| Memory | after load 389.6 GiB weights + 67.5 GiB caches; peak wired 449.1 GiB; compressor 0.49 GiB; lowest reclaimable about 50 GiB; no swap growth |
+
+Requirements: a 512 GB Mac, the GPU wired limit raised (`sudo sysctl iogpu.wired_limit_mb=500000`, at your own
+risk), and nothing else large running.
+
+Why no MTP head at 1M: with the head loaded, the peak would be about 467 GiB and reclaimable memory would fall to
+about 44 GiB, under the 45 GiB line this project keeps free for macOS. With MTP, use up to 393k tokens on the bf16
+cache (above), or more on the 8-bit cache: a `long-mtp` setting (8-bit cache with MTP, expected about 850-900k
+tokens) is being measured and is not published yet.
+
+`GLM_AX_PROMPT_ROWS=2048` shrinks the prompt-time scratch (default 8192 rows) so the 1M prompt fits; it slows
+prompt processing a little.
+
+### 8-bit cache quality
+
+`GLM_AX_K8=1` stores the MLA latent cache as 576 int8 codes plus 9 half-precision scales a row (8 groups of 64
+latent values, 1 group for the 64 roped dimensions, quantised after the rope) and the indexer keys as 128 int8 codes
+plus 2 half scales: 49.8 KB a token against 96.6 KB in bf16. `GLM_AX_K8=lat` or `=idx` quantises only one of the
+two caches.
+
+| Check | 8-bit | bf16 |
+|---|---:|---:|
+| Teacher-forced next-token matches with real text, 3k-token prompt | 774 | 781 |
+| Same, 20k-token prompt | 4,812 | 4,786 |
+| Top-1 agreement with bf16 (random-word prompt) | about 80% | 80.19% between two exact bf16 attention kernels |
+| Prefill at 39k tokens | 688.9 tok/s | 699.9 tok/s |
+| Short-context decode: prose / greedy / code (tok/s) | 34.3 / 35.8 / 41.4 | 34.5 / 36.6 / 41.6 |
+
+- Per-layer attention error about 0.5% (2.2% after 8 layers); the indexer selects identical keys.
+- Known answers identical; needles 5/5 at about 18k and 71k tokens.
+- The top-1 agreement on the random-word prompt is the same as swapping between two exact bf16 attention kernels,
+  i.e. at noise level.
+
 ## Get the weights
 
 Download the 4-bit pack and the MTP head (about 418 GB together):
@@ -249,14 +351,15 @@ server-less runner.
 
 ### Prebuilt binary
 
-The [v0.2.1-glm53-prefill release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.1-glm53-prefill)
+The [v0.3.0-glm53-1m release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.3.0-glm53-1m)
 has `tensorfold-native` built from this source (`zig build native`, fast mode, Zig 0.17.0, Xcode 27.2 Metal
 toolchain) as a .tar.gz with its SHA-256, plus the licence files. It needs macOS 27.2.1 or later (the SDK it was
 built with). It is ad-hoc signed, not notarized: after downloading, run
-`xattr -d com.apple.quarantine tensorfold-native`. No weights are included. The
-[v0.1.0 release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp)
-and the [v0.2.0 release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill) stay available, with their sources at their tags. All three release binaries were run on the model after
-publishing (see Results).
+`xattr -d com.apple.quarantine tensorfold-native`. No weights are included. `oneshot.sh` is attached to the same
+release. **The v0.3.0 binary is pending verification on the model**; the numbers in this README come from the
+same source built in place. The [v0.1.0](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp),
+[v0.2.0](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill) and [v0.2.1](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.1-glm53-prefill) releases stay available, with their
+sources at their tags; those three binaries were run on the model after publishing (see Results).
 
 ## Serve
 
@@ -292,7 +395,12 @@ curl -s 127.0.0.1:8020/v1/chat/completions -H 'Content-Type: application/json' \
 
 | Variable | Effect |
 |---|---|
-| `GLM_AX_LOAD_LIMIT_GB` | load limit in GB (default 75% of RAM); 440 was used |
+| `GLM_AX_LOAD_LIMIT_GB` | load limit in GB (default 75% of RAM); 440 for the 32k benchmarks, 470 for 256k, 488 for 393k (bf16), 495 for 1M (8-bit) |
+| `GLM_AX_K8` | `1`: 8-bit latent and index caches (49.8 KB a token instead of 96.6 KB); `lat` or `idx`: only one of them; unset: bf16 |
+| `GLM_AX_PROMPT_ROWS` | prompt chunk rows, 1024-8192 in steps of 64 (default 8192); smaller means less prompt scratch memory (2048 for 1M) |
+| `GLM_AX_BATCH=1` | **experimental**: batched verify across streams for `--parallel` > 1 (measured +24% total throughput at 4 streams on the bf16 cache; greedy output under load equal to running alone 4/4; still being measured) |
+| `GLM_AX_DUAL=1` | **experimental**, with `GLM_AX_DSPARK`: each stream's rounds use DSpark or the MTP head, whichever measures faster; exact, but slower than MTP alone on prose |
+| `GLM_AX_DECODE_NAX=1` | **untested, do not use**: tensor-unit attention for decode rows |
 | `GLM_AX_DRAFT_DEPTH` | MTP drafts a window holds, 1-3 (default 2 since v0.2.1); 1 is best for prose |
 | `GLM_AX_MTP_FLOOR` | 0-1: verify a draft past the first only while the MTP head's running confidence (product of its drafts' top probabilities) stays at or above it, and stop drafting there; default 0.7 since v0.2.1, `off` verifies every requested draft |
 | `GLM_AX_DSPARK=<dir>` | use RedHat AI's DSpark drafter (`RedHatAI/GLM-5.3-speculator.dspark`) instead of MTP; `GLM_AX_DSPARK_FLOOR` sets its confidence cut (0.5 measured), `GLM_AX_DSPARK_DEPTH` its most drafts (1-8) |
@@ -321,10 +429,11 @@ The scripts use only the Python standard library.
 
 ## Limitations
 
-- Single stream only (`--parallel 1`).
-- Answers (needles), memory, prompt rate and decode were measured up to about 255k tokens of context; code decode
-  at 256k was not run. Contexts beyond 256k were not tried. Decode slows with context (about 26 tok/s for prose at
-  128k, 21 at 256k).
+- One stream at a time by default (`--parallel 1`); multi-stream batching (`GLM_AX_BATCH=1`) is experimental.
+- Answers (needles) and memory were checked up to 1,026,813 tokens (8-bit cache, no MTP) and 375k (bf16, MTP);
+  decode speed was measured to 255k with MTP and at 1M without it (7.4 tok/s). Code decode at 256k was not run.
+  Decode slows with context (about 26 tok/s for prose at 128k, 21 at 256k, 7.4 at 1M without MTP).
+- The 1M setting has no MTP head (memory), and its first token takes about an hour.
 - Not bit-identical to MLX (summation order), see above.
 - The DFlash2 drafter path is in the code but not benchmarked for this README; the DSpark row comes from an
   earlier build (tf32).

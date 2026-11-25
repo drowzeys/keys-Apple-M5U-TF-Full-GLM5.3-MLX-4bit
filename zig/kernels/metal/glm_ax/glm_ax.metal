@@ -4,6 +4,45 @@
 using namespace metal;
 
 constant constexpr uint LAT = 512, ROPE = 64, NOPE = 192, KEY = LAT + ROPE, QK = NOPE + ROPE, QA = 2048;
+
+// The caches' rows (GLM_AX_K8=1 builds these with GX_K8): the latent cache's are bf16 [576] (512 latent, 64 roped),
+// or 8-bit codes [576] then nine half scales (the eight 64-wide latent groups, the roped 64), 608 bytes; the index
+// cache's are bf16 [128], or 8-bit codes [128] then two half scales (its two 64-wide halves), 136 bytes. Codes are
+// round(v / scale), scale = the group's largest |v| / 127 (as a half).
+#ifndef GX_KACCESS
+#define GX_KACCESS
+// GX_K8: the latent cache 8-bit; GX_K8I: the index cache 8-bit (each on its own, GLM_AX_K8=lat / idx / 1 for both)
+#ifdef GX_K8
+typedef uchar gx_kt;
+constant constexpr long GX_KROW = 608;
+inline float gx_ks(const device gx_kt* row, int d) { return float(((const device half*)(row + 576))[d >> 6]); }
+inline bfloat gx_kget(const device gx_kt* keys, long r, int d) {
+  const device gx_kt* row = keys + r * GX_KROW;
+  return bfloat(float(as_type<char>(row[d])) * gx_ks(row, d));
+}
+inline bfloat4 gx_kget4(const device gx_kt* keys, long r, int d) {
+  const device gx_kt* row = keys + r * GX_KROW;
+  return bfloat4(float4(*(const device char4*)(row + d)) * gx_ks(row, d));
+}
+#else
+typedef bfloat gx_kt;
+constant constexpr long GX_KROW = 576;
+inline bfloat gx_kget(const device gx_kt* keys, long r, int d) { return keys[r * 576 + d]; }
+inline bfloat4 gx_kget4(const device gx_kt* keys, long r, int d) { return *(const device bfloat4*)(keys + r * 576 + d); }
+#endif
+#ifdef GX_K8I
+typedef uchar gx_it;
+constant constexpr long GX_IROW = 136;
+inline float gx_iget(const device gx_it* row, uint i) { return float(as_type<char>(row[i])) * float(((const device half*)(row + 128))[i >> 6]); }
+#else
+typedef bfloat gx_it;
+constant constexpr long GX_IROW = 128;
+inline float gx_iget(const device gx_it* row, uint i) { return float(row[i]); }
+#endif
+// A group's 8-bit scale from its largest |v| (a half), and v's code under it.
+inline half gx_qscale(float amax) { return half(amax / 127.0f); }
+inline char gx_qcode(float v, half s) { return float(s) > 0.0f ? char(clamp(rint(v / float(s)), -127.0f, 127.0f)) : char(0); }
+#endif
 constant constexpr uint IH = 32, ID = 128, IROPE = 64, TOPK = 2048, IW = 64;
 
 // A row: its position and where its key list starts in `keys` (the top-k writes `nkeys`; shared layers read it).
@@ -278,10 +317,12 @@ kernel void gx_prep(const device bfloat* qa [[buffer(0)]], const device bfloat* 
                     const device bfloat* w_qa [[buffer(2)]], const device bfloat* w_kva [[buffer(3)]],
                     const device float* inv [[buffer(4)]], const device gx_row* rows [[buffer(5)]],
                     constant gx_args& a [[buffer(6)]], device bfloat* qr [[buffer(7)]],
-                    device bfloat* cache [[buffer(8)]], uint row [[threadgroup_position_in_grid]],
+                    device gx_kt* cache [[buffer(8)]], uint row [[threadgroup_position_in_grid]],
                     uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float part[2][8];
+  threadgroup float gmax[2][8];
+  threadgroup float rope_max;
   const device bfloat* x = qa + ulong(row) * (a.in_stride ? a.in_stride : QA);
   const device bfloat* k = kva + ulong(row) * (a.in_stride ? a.in_stride : KEY);
   float sq = 0.0f, sk = 0.0f;
@@ -296,6 +337,7 @@ kernel void gx_prep(const device bfloat* qa [[buffer(0)]], const device bfloat* 
   const float rq = precise::rsqrt(vq / float(QA) + a.eps), rk = precise::rsqrt(vk / float(LAT) + a.eps);
   for (uint i = t; i < QA; i += 256) qr[ulong(row) * QA + i] = bfloat(float(w_qa[i]) * (float(x[i]) * rq));
   const gx_row r = rows[row];
+#ifndef GX_K8
   device bfloat* key = cache + ulong(r.pos) * KEY;
   for (uint i = t; i < LAT; i += 256) key[i] = bfloat(float(w_kva[i]) * (float(k[i]) * rk));
   if (t < ROPE / 2) {
@@ -303,6 +345,32 @@ kernel void gx_prep(const device bfloat* qa [[buffer(0)]], const device bfloat* 
     key[LAT + t] = bfloat(o.x);
     key[LAT + ROPE / 2 + t] = bfloat(o.y);
   }
+#else
+  // the values as bf16 (as the bf16 cache holds them), then each 64-wide group's codes under its own scale
+  device gx_kt* key = cache + ulong(r.pos) * GX_KROW;
+  const float v0 = float(bfloat(float(w_kva[t]) * (float(k[t]) * rk)));
+  const float v1 = float(bfloat(float(w_kva[t + 256]) * (float(k[t + 256]) * rk)));
+  float2 o = float2(0.0f);
+  if (t < ROPE / 2) o = gx_rope(float(k[LAT + 2 * t]), float(k[LAT + 2 * t + 1]), r.pos, inv, t);
+  const float ox = float(bfloat(o.x)), oy = float(bfloat(o.y));
+  // simdgroup sg holds group sg / 2 (v0) and 4 + sg / 2 (v1); simdgroup 0's lanes also the 64 roped values
+  const float m0 = simd_max(fabs(v0)), m1 = simd_max(fabs(v1)), mr = simd_max(max(fabs(ox), fabs(oy)));
+  if (lane == 0) gmax[0][sg] = m0, gmax[1][sg] = m1;
+  if (sg == 0 && lane == 0) rope_max = mr;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint g = sg / 2;
+  const half s0 = gx_qscale(max(gmax[0][2 * g], gmax[0][2 * g + 1])), s1 = gx_qscale(max(gmax[1][2 * g], gmax[1][2 * g + 1]));
+  key[t] = as_type<uchar>(gx_qcode(v0, s0));
+  key[t + 256] = as_type<uchar>(gx_qcode(v1, s1));
+  device half* sc = (device half*)(key + KEY);
+  if (t % 64 == 0) sc[t / 64] = s0, sc[4 + t / 64] = s1;
+  if (t < ROPE / 2) {
+    const half sr = gx_qscale(rope_max);
+    key[LAT + t] = as_type<uchar>(gx_qcode(ox, sr));
+    key[LAT + ROPE / 2 + t] = as_type<uchar>(gx_qcode(oy, sr));
+    if (t == 0) sc[8] = sr;
+  }
+#endif
 }
 
 // Each (row, head)'s roped q_rope into its query row's last 64 dims (bf16 [rows, heads, 576]): q is [rows, heads,
@@ -399,7 +467,7 @@ kernel void gx_merge(const device float* partial [[buffer(0)]], const device gx_
 kernel void gx_index_key(const device bfloat* ik [[buffer(0)]], const device bfloat* w [[buffer(1)]],
                          const device bfloat* b [[buffer(2)]], const device float* inv [[buffer(3)]],
                          const device gx_row* rows [[buffer(4)]], constant gx_args& a [[buffer(5)]],
-                         device bfloat* cache [[buffer(6)]], uint row [[threadgroup_position_in_grid]],
+                         device gx_it* cache [[buffer(6)]], uint row [[threadgroup_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]]) {
   const device bfloat* x = ik + ulong(row) * (a.in_stride ? a.in_stride : ID);
   float v[4], s = 0.0f;
@@ -415,12 +483,24 @@ kernel void gx_index_key(const device bfloat* ik [[buffer(0)]], const device bfl
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const gx_row r = rows[row];
-  device bfloat* key = cache + ulong(r.pos) * ID;
   const float2 o = gx_rope(y[2 * lane], y[2 * lane + 1], r.pos, inv, lane);
+#ifndef GX_K8I
+  device bfloat* key = cache + ulong(r.pos) * ID;
   key[lane] = bfloat(o.x);
   key[IROPE / 2 + lane] = bfloat(o.y);
   key[IROPE + lane] = bfloat(y[IROPE + lane]);
   key[IROPE + 32 + lane] = bfloat(y[IROPE + 32 + lane]);
+#else
+  device gx_it* key = cache + ulong(r.pos) * GX_IROW;
+  const float a0 = float(bfloat(o.x)), a1 = float(bfloat(o.y));
+  const float b0 = float(bfloat(y[IROPE + lane])), b1 = float(bfloat(y[IROPE + 32 + lane]));
+  const half s0 = gx_qscale(simd_max(max(fabs(a0), fabs(a1)))), s1 = gx_qscale(simd_max(max(fabs(b0), fabs(b1))));
+  key[lane] = as_type<uchar>(gx_qcode(a0, s0));
+  key[IROPE / 2 + lane] = as_type<uchar>(gx_qcode(a1, s0));
+  key[IROPE + lane] = as_type<uchar>(gx_qcode(b0, s1));
+  key[IROPE + 32 + lane] = as_type<uchar>(gx_qcode(b1, s1));
+  if (lane == 0) ((device half*)(key + ID))[0] = s0, ((device half*)(key + ID))[1] = s1;
+#endif
 }
 
 // The keys a thread scores at once: the query is read once for the block, not once a key.
@@ -430,7 +510,7 @@ constant constexpr uint THREADS = 128;
 // Row r, keys 256 tg.x ..: score = sum_h (w_h / sqrt 32) relu(q_h . k / sqrt 128), heads in order, q roped here.
 // A threadgroup scores THREADS * BLOCK = 256 keys: the dispatch is (last_pos / 256 + 1, rows).
 kernel void gx_index_scores(const device bfloat* q [[buffer(0)]], const device bfloat* iw [[buffer(1)]],
-                            const device bfloat* cache [[buffer(2)]], const device gx_row* rows [[buffer(3)]],
+                            const device gx_it* cache [[buffer(2)]], const device gx_row* rows [[buffer(3)]],
                             constant gx_args& a [[buffer(4)]], device float* score [[buffer(5)]],
                             const device float* inv [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
                             uint t [[thread_index_in_threadgroup]]) {
@@ -457,14 +537,14 @@ kernel void gx_index_scores(const device bfloat* q [[buffer(0)]], const device b
   for (uint b = 0; b < BLOCK; ++b)
     for (uint h = 0; h < IH; ++h) d[b][h] = 0.0f;
   float kv[BLOCK];
-  const device bfloat* kb[BLOCK];
+  const device gx_it* kb[BLOCK];
   uint kk[BLOCK];
   for (uint b = 0; b < BLOCK; ++b) {
     kk[b] = kbase + b * THREADS;
-    kb[b] = cache + ulong(min(kk[b], row.pos)) * ID;
+    kb[b] = cache + ulong(min(kk[b], row.pos)) * GX_IROW;
   }
   for (uint i = 0; i < ID; ++i) {
-    for (uint b = 0; b < BLOCK; ++b) kv[b] = kk[b] <= row.pos ? float(kb[b][i]) : 0.0f;
+    for (uint b = 0; b < BLOCK; ++b) kv[b] = kk[b] <= row.pos ? gx_iget(kb[b], i) : 0.0f;
     for (uint h = 0; h < IH; ++h) {
       const float qv = qs[h * ID + i];
       for (uint b = 0; b < BLOCK; ++b) d[b][h] = fma(qv, kv[b], d[b][h]);
@@ -490,7 +570,7 @@ kernel void gx_index_topk(const device float* score [[buffer(0)]], device gx_row
                           constant gx_args& a [[buffer(2)]], device uint* list [[buffer(3)]],
                           uint r [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup atomic_uint hist[256];
+  threadgroup atomic_uint hist[2048];
   threadgroup uint found[2];
   threadgroup uint sums[2][32];
   const gx_row row = rows[r];
@@ -502,28 +582,37 @@ kernel void gx_index_topk(const device float* score [[buffer(0)]], device gx_row
     if (t == 0) rows[r].nkeys = n;
     return;
   }
+  // three radix passes of 11, 11 and 10 bits (four of 8 before: a read of the scores fewer), each pass's bin found
+  // by a parallel suffix sum over the bins (a thread its two, simdgroups' totals through threadgroup memory)
   uint prefix = 0, mask = 0, need = TOPK;
-  for (int shift = 24; shift >= 0; shift -= 8) {
-    if (t < 256) atomic_store_explicit(&hist[t], 0u, memory_order_relaxed);
+  const int shifts[3] = {21, 10, 0};
+  const uint widths[3] = {11, 11, 10};
+  for (int pass = 0; pass < 3; ++pass) {
+    const int shift = shifts[pass];
+    const uint bins = 1u << widths[pass];
+    for (uint i = t; i < 2048; i += 1024) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = t; i < n; i += 1024) {
       const uint k = gx_order(sc[i]);
-      if ((k & mask) == prefix) atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
+      if ((k & mask) == prefix) atomic_fetch_add_explicit(&hist[(k >> shift) & (bins - 1u)], 1u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
-      uint above = 0, b = 255;
-      for (;; --b) {
-        const uint c = atomic_load_explicit(&hist[b], memory_order_relaxed);
-        if (above + c >= need || b == 0) break;
-        above += c;
-      }
-      found[0] = b;
-      found[1] = need - above;
-    }
+    // thread t owns bins 2047-2t and 2046-2t (from the top); counts above its pair: the suffix it needs
+    const uint hi_bin = 2047u - 2u * t, lo_bin = 2046u - 2u * t;
+    const uint c_hi = atomic_load_explicit(&hist[hi_bin], memory_order_relaxed);
+    const uint c_lo = atomic_load_explicit(&hist[lo_bin], memory_order_relaxed);
+    const uint pair = c_hi + c_lo;
+    const uint in_sg = simd_prefix_exclusive_sum(pair);
+    if (lane == 31) sums[0][sg] = in_sg + pair;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint before = in_sg;
+    for (uint g = 0; g < sg; ++g) before += sums[0][g];
+    // the bin where the count from the top first reaches `need`
+    if (before < need && before + c_hi >= need) { found[0] = hi_bin; found[1] = need - before; }
+    else if (before + c_hi < need && before + pair >= need) { found[0] = lo_bin; found[1] = need - before - c_hi; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     prefix |= found[0] << shift;
-    mask |= 255u << shift;
+    mask |= (bins - 1u) << shift;
     need = found[1];
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

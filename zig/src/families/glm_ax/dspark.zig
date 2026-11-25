@@ -15,6 +15,8 @@ const wts = @import("weights.zig");
 const fwd = @import("forward.zig");
 const Model = @import("model.zig").Model;
 const K = @import("dflash2.zig").Kernel;
+const Metal = @import("backend.zig").Metal;
+const be = lanes.backend;
 
 const dr = lanes.drafter;
 const Stream = lanes.Stream;
@@ -156,7 +158,26 @@ const Lane = struct {
     held: [max_block]u32 = @splat(0),
     chance: [max_block]f64 = @splat(0),
     held_len: u32 = 0,
+    /// GLM_AX_DUAL: who drafts this stream's rounds (the MTP head or DSpark), chosen from measured tokens a ms
+    mode: Mode = .dspark,
+    rounds: u32 = 0, // rounds since the stream opened
+    stat: [2]struct { tokens: f64 = 0, ms: f64 = 0 } = .{ .{}, .{} },
+    last_hold: i128 = 0,
+    last_mode: Mode = .dspark,
+    // the last absorb: its kept rows' count, the token after each, its start, whether it was the first after a prompt
+    last_n: u32 = 0,
+    last_follow: [16]u32 = @splat(0),
+    last_start: u64 = 0,
+    last_first: bool = false,
 };
+
+const Mode = enum(u8) { dspark, mtp };
+
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
 
 const fields = [_][]const u8{ "ids", "resid", "x", "qkv", "q", "attn", "y", "gu", "act", "logits", "pm", "pl", "po", "tv", "ti", "tv2", "ti2", "uv", "ui", "seq", "conf", "fcx", "hctx", "kv", "sums" };
 
@@ -184,6 +205,8 @@ pub const Drafter = struct {
     s: [fields.len]mtl.Buffer = undefined,
     /// GLM_AX_DSPARK_FLOOR: the chance cut (a running product of the confidences) the lane engine verifies down to
     floor: ?f64 = null,
+    /// GLM_AX_DUAL=1: the target's backend, whose MTP head drafts a stream's rounds when that measures faster
+    mtp: ?*Metal = null,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, target: *Model, dir: []const u8) !*Drafter {
         const pool = mtl.objc.Pool.push();
@@ -319,7 +342,11 @@ pub const Drafter = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *Stream) void {
         const d = cast(ptr);
-        if (d.lanes.fetchRemove(s)) |e| d.dropLane(e.value);
+        if (d.lanes.fetchRemove(s)) |e| {
+            const l = e.value;
+            if (d.mtp != null) std.log.info("glm_ax: dual drafting: {d} rounds; DSpark {d:.0} tokens in {d:.0} ms, MTP {d:.0} tokens in {d:.0} ms", .{ l.rounds, l.stat[0].tokens, l.stat[0].ms, l.stat[1].tokens, l.stat[1].ms });
+            d.dropLane(l);
+        }
     }
 
     fn heldFn(ptr: *anyopaque, streams: []const *Stream, out: []const []u32) anyerror!void {
@@ -433,10 +460,57 @@ pub const Drafter = struct {
             }
             l.end = end;
             l.held_len = 0;
+            l.last_n = f.rows;
+            l.last_start = it.start;
+            l.last_first = it.prompt;
+            const keep = @min(it.follow.len, l.last_follow.len);
+            @memcpy(l.last_follow[0..keep], it.follow[0..keep]);
         }
         e.end();
         cb.commit();
         d.pending = cb.retain();
+    }
+
+    /// GLM_AX_DUAL's choice for a stream's next round: the MTP head first (12 rounds), DSpark tried for 8, then
+    /// DSpark only when it measures 15% more tokens a ms; the other tried again for 8 rounds every 128.
+    fn choose(l: *Lane) Mode {
+        const r = l.rounds;
+        if (r < 12) return .mtp;
+        if (r < 20) return .dspark;
+        const rate = struct {
+            fn of(x: anytype) f64 {
+                return if (x.ms > 0) x.tokens / x.ms else 0;
+            }
+        };
+        const best: Mode = if (rate.of(l.stat[@intFromEnum(Mode.dspark)]) > 1.15 * rate.of(l.stat[@intFromEnum(Mode.mtp)])) .dspark else .mtp;
+        if (r % 128 >= 120) return if (best == .mtp) .dspark else .mtp;
+        return best;
+    }
+
+    /// Whether a DSpark round still feeds the kept rows to the MTP head: while probing or when MTP is the
+    /// stream's drafter, yes; while DSpark wins (outside a probe), no (the head's cache then has gaps over those rows,
+    /// which costs it acceptance after a switch back, never exactness).
+    fn feedMtp(l: *Lane) bool {
+        const r = l.rounds;
+        if (r < 20) return true;
+        return r % 128 >= 112; // the 8 rounds before a probe of MTP, and the probe: the head catches up
+    }
+
+    /// The MTP head's drafts for a stream this round (or its absorb alone, depth 0), into the lane.
+    fn mtpRound(d: *Drafter, l: *Lane, it: dr.Hold, depth: u32) !void {
+        const m = d.mtp orelse return error.NoMtpBackend;
+        const n: usize = @max(1, l.last_n);
+        var rows: [16]u32 = undefined;
+        for (0..n) |i| rows[i] = @intCast(i);
+        const follow_last = [1]u32{it.pending};
+        const req: be.DraftRequest = if (l.last_first or l.last_n == 0)
+            .{ .stream = it.stream, .follow = &follow_last, .rows = null, .start = l.last_start, .position = it.position, .depth = depth }
+        else
+            .{ .stream = it.stream, .follow = l.last_follow[0..@min(n, 16)], .rows = rows[0..@min(n, 16)], .start = l.last_start, .position = it.position, .depth = depth };
+        try m.mtpDraft(req);
+        if (depth == 0) return;
+        l.held_len = @intCast(try m.mtpHeld(it.stream, l.held[0..@min(it.depth, max_block)], l.chance[0..@min(it.depth, max_block)]));
+        for (l.held_len..max_block) |j| l.chance[j] = 0;
     }
 
     fn settle(d: *Drafter) !void {
@@ -518,8 +592,40 @@ pub const Drafter = struct {
 
     fn holdFn(ptr: *anyopaque, items: []const dr.Hold) anyerror!void {
         const d = cast(ptr);
-        const c = &d.config;
         try d.settle();
+        if (d.mtp != null) {
+            // per-request choice: each stream's last round credited to its drafter, then this round's chosen
+            var ds: [max_blocks]dr.Hold = undefined;
+            var nds: usize = 0;
+            for (items) |it| {
+                const l = d.lanes.get(it.stream) orelse return error.DraftStreamUnknown;
+                const now = nowNs();
+                if (l.last_hold != 0 and l.rounds > 0) {
+                    const st = &l.stat[@intFromEnum(l.last_mode)];
+                    st.tokens += @floatFromInt(l.last_n);
+                    st.ms += @as(f64, @floatFromInt(now - l.last_hold)) / 1e6;
+                }
+                l.last_hold = now;
+                const mode = choose(l);
+                l.last_mode = mode;
+                l.rounds += 1;
+                if (mode == .mtp) {
+                    try d.mtpRound(l, it, @min(it.depth, 2));
+                } else {
+                    if (feedMtp(l)) try d.mtpRound(l, it, 0); // the head keeps up (see feedMtp)
+                    if (nds == ds.len) return error.TooManyDraftStreams;
+                    ds[nds] = it;
+                    nds += 1;
+                }
+            }
+            if (nds == 0) return;
+            return d.holdBlocks(ds[0..nds]);
+        }
+        return d.holdBlocks(items);
+    }
+
+    fn holdBlocks(d: *Drafter, items: []const dr.Hold) anyerror!void {
+        const c = &d.config;
         var at: usize = 0;
         while (at < items.len) {
             const count = @min(items.len - at, max_blocks);

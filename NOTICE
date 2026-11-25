@@ -28,6 +28,8 @@ The DSpark drafter code (glm_ax/dspark.zig) was written from the semantics of
 RedHat AI's speculators (DSparkDraftModel) and vLLM's qwen3_dspark / dspark
 speculator code (both Apache-2.0), read only, not copied; the DFlash2 drafter
 (glm_ax/dflash2.zig) follows SGLang's DFlash2DraftModel (Apache-2.0) the same way.
+oneshot.sh (setup script) and the 8-bit KV cache of v0.3.0 are this repository's
+own work.
 These changes are released under the same Apache License, Version 2.0.
 
 -------------------------------------------------------------------------------

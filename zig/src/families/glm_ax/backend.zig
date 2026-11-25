@@ -78,6 +78,9 @@ pub const Metal = struct {
     ahead_stream: ?*lanes.Stream = null,
     /// A drafter's features: each stream's tapped rows at every position (prepare_features turns them on).
     tapping: bool = false,
+    /// GLM_AX_BATCH: windows verified together, and their rows
+    batched_rounds: usize = 0,
+    batched_rows: usize = 0,
     taps: std.AutoHashMapUnmanaged(*st.Cache, mtl.Buffer) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
@@ -130,7 +133,7 @@ pub const Metal = struct {
     pub fn facts(self: *const Metal) lanes.Model {
         // rows are independent in every kernel of a decode window, so any width to 16 gives one-row steps' bits
         const mtp = self.model.config.mtp > 0;
-        return .{ .exact_width = st.window_rows, .mtp = mtp, .speculate = mtp, .speculate_early = false, .drafts = if (mtp) @intCast(depthCap()) else 1, .max_streams = self.options.streams, .streams_exact = true, .draft_confidence = if (mtp) mtpFloor() else null, .draft_probabilities = mtp and mtpFloor() != null };
+        return .{ .exact_width = st.window_rows, .mtp = mtp, .speculate = mtp, .speculate_early = false, .drafts = if (mtp) @intCast(depthCap()) else 1, .max_streams = self.options.streams, .streams_exact = true, .hidden_rows = batchOn(), .plain_share = batchOn(), .batch_rows = if (batchOn()) st.window_rows else 0, .draft_confidence = if (mtp) mtpFloor() else null, .draft_probabilities = mtp and mtpFloor() != null };
     }
 
     pub fn backend(self: *Metal) be.Backend {
@@ -151,6 +154,11 @@ pub const Metal = struct {
     }
 
     /// The tapped rows' place for a pass starting at `start` (null: no drafter, or the cache has none).
+    fn batchOn() bool {
+        const v = std.c.getenv("GLM_AX_BATCH") orelse return false;
+        return v[0] == '1';
+    }
+
     fn tapsAt(self: *Metal, cache: *st.Cache, start: usize) ?fwd.B {
         if (!self.tapping) return null;
         const x = self.taps.get(cache) orelse return null;
@@ -291,9 +299,10 @@ pub const Metal = struct {
         const c = &self.model.config;
         var cache = try st.Cache.init(self.model.device, c, st.prompt_rows + 2);
         defer cache.deinit();
-        var ids: [st.prompt_rows]u32 = undefined;
-        for (&ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37 % 20000);
-        try self.feed(&cache, &ids, null);
+        var ids_all: [st.prompt_rows_max]u32 = undefined;
+        const ids = ids_all[0..st.prompt_rows];
+        for (ids, 0..) |*t, i| t.* = @intCast(1000 + i * 37 % 20000);
+        try self.feed(&cache, ids, null);
         try fwd.run(self.model, &self.scratch, &cache, &.{ids[0]}, .{ .all = true, .hidden = .{ .buf = cache.hidden } });
     }
 
@@ -407,6 +416,11 @@ pub const Metal = struct {
         const c = &self.model.config;
         const words = (c.vocab + 31) / 32;
         if (windows.len != out.len) return error.InvalidGlmWindows;
+        if (windows.len > 1 and !self.tapping and batchOn()) {
+            var total: usize = 0;
+            for (windows) |w| total += w.rows();
+            if (total <= st.window_rows) return self.verifyBatch(windows, out);
+        }
         for (windows, out) |w, o| {
             const rows = w.rows();
             if (rows > st.window_rows or w.parents != null or o.sampled.len != rows or o.drafts.len != rows - 1) return error.UnsupportedGlmWindow;
@@ -444,6 +458,63 @@ pub const Metal = struct {
             }
             // the last kept row's logits are the next first draw's (the lane core keeps every row here)
             @memcpy(cache.logits.slice(u16, c.vocab), all[(rows - 1) * c.vocab ..][0..c.vocab]);
+        }
+    }
+
+    /// GLM_AX_BATCH=1: several streams' windows verified in one forward (forward.runMany), at most window_rows rows.
+    fn verifyBatch(self: *Metal, windows: []const be.Window, out: []be.Verified) !void {
+        const c = &self.model.config;
+        const words = (c.vocab + 31) / 32;
+        var ids: [st.window_rows]u32 = undefined;
+        var segs: [st.window_rows]fwd.Seg = undefined;
+        var caches: [st.window_rows]*st.Cache = undefined;
+        var at: usize = 0;
+        for (windows, out, 0..) |w, o, k| {
+            const rows = w.rows();
+            if (rows > st.window_rows or w.parents != null or o.sampled.len != rows or o.drafts.len != rows - 1) return error.UnsupportedGlmWindow;
+            const cache = try self.cacheOf(w.stream);
+            for (caches[0..k]) |other| if (other == cache) return error.InvalidGlmWindows;
+            if (w.held > cache.nheld) return error.GlmDraftsNotHeld;
+            for (w.positions, 0..) |p, r| if (p != cache.len + r + 1) return error.InvalidGlmPosition;
+            ids[at] = w.pending;
+            @memcpy(ids[at + 1 ..][0..w.held], cache.held[0..w.held]);
+            @memcpy(ids[at + 1 + w.held ..][0..w.tokens.len], w.tokens);
+            segs[k] = .{ .cache = cache, .start = cache.len, .n = rows };
+            caches[k] = cache;
+            at += rows;
+        }
+        const t_start = profStart(caches[0]);
+        try fwd.runMany(self.model, &self.scratch, segs[0..windows.len], ids[0..at], .{ .all = true, .hidden = .{ .buf = caches[0].hidden } });
+        const t_end = now();
+        self.batched_rounds += 1;
+        self.batched_rows += at;
+        if (self.batched_rounds % 500 == 1) std.log.info("glm_ax: batched verify: {d} rounds, {d:.2} rows a round; this one {d} streams, {d} rows, {d:.1} ms", .{ self.batched_rounds, @as(f64, @floatFromInt(self.batched_rows)) / @as(f64, @floatFromInt(self.batched_rounds)), windows.len, at, secs(t_start, t_end) * 1e3 });
+        const all = self.scratch.logits_all.slice(u16, at * c.vocab);
+        var r0: usize = 0;
+        for (windows, out, 0..) |w, o, k| {
+            const rows = w.rows();
+            const cache = caches[k];
+            cache.prof.verify += 1;
+            cache.prof.verify_gpu += self.scratch.last_gpu / @as(f64, @floatFromInt(windows.len));
+            cache.prof.last_end = t_end;
+            cache.prof.verify_wall += secs(t_start, t_end) / @as(f64, @floatFromInt(windows.len));
+            cache.len += rows;
+            cache.nheld = 0;
+            cache.drafted += rows - 1;
+            cache.accepted += rows - 1;
+            for (0..@min(rows - 1, 8)) |j| {
+                cache.drafted_at[j] += 1;
+                cache.accepted_at[j] += 1;
+            }
+            @memcpy(o.drafts, ids[r0 + 1 ..][0 .. rows - 1]);
+            for (0..rows) |r| {
+                const l = all[(r0 + r) * c.vocab ..][0..c.vocab];
+                const mask = if (w.masks.len >= (r + 1) * words) w.masks[r * words ..][0..words] else &.{};
+                o.sampled[r] = try draw(self.gpa, l, w.stream.sampling, w.positions[r], mask);
+                if (o.rows.len == rows) o.rows[r] = row(l, o.sampled[r], w.stream.logprobs orelse 0);
+            }
+            @memcpy(cache.logits.slice(u16, c.vocab), all[(r0 + rows - 1) * c.vocab ..][0..c.vocab]);
+            r0 += rows;
         }
     }
 
@@ -534,6 +605,19 @@ pub const Metal = struct {
         for (out, 0..) |*o, i| o.* = if (i < cache.nheld) cache.chance[i] else 0;
         if (cache.nheld < out.len) stream.draft_chances_cut = cache.nheld;
         return true;
+    }
+
+    /// For a drafter that hands some streams' rounds to the MTP head (dspark.zig's per-request choice): the head's
+    /// drafts for `r` (depth 0: absorb the kept rows only), its held drafts and their running chances.
+    pub fn mtpDraft(self: *Metal, r: be.DraftRequest) !void {
+        return draftFn(self, &.{r});
+    }
+    pub fn mtpHeld(self: *Metal, stream: *lanes.Stream, out: []u32, chances: []f64) !usize {
+        const cache = try self.cacheOf(stream);
+        const n = @min(out.len, cache.nheld);
+        @memcpy(out[0..n], cache.held[0..n]);
+        for (chances[0..n], 0..) |*o, i| o.* = cache.chance[i];
+        return n;
     }
 
     /// The held drafts in window order, for a grammar to walk.

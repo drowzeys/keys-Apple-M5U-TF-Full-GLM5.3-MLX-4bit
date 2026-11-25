@@ -30,6 +30,8 @@ var c1: bool = false;
 var c8: bool = false;
 /// GLM_AX_K4_ROWS=1: gx_proj_k4 a row a pass (gx_proj_k4_1), the quarter read again from cache for the next row.
 var k4_rows: bool = false;
+/// GLM_AX_DECODE_NAX=1: decode rows' index scores on the tensor units too (gx_index_nax, a simdgroup a threadgroup)
+var decode_nax: bool = false;
 var split_read: bool = false;
 
 pub const GArgs = extern struct { rows: u32 = 0, heads: u32 = 0, width: u32 = 0, stride: u32 = 0, score_stride: u32 = 0, in_stride: u32 = 0, pad0: u32 = 0, pad1: u32 = 0, eps: f32 = 0, scale: f32 = 0, key_scale: f32 = 0, head_scale: f32 = 0 };
@@ -336,8 +338,24 @@ fn rowTable(s: *st.Scratch, c: *const cfg.Config, start: usize, n: usize) void {
     for (s.rowtab.slice(st.Row, n), 0..) |*r, i| r.* = .{ .pos = @intCast(start + i), .list = @intCast(i * c.i_topk) };
 }
 
+/// One stream's rows of a batched forward: `n` rows at positions `start`.. of its own caches.
+pub const Seg = struct { cache: *st.Cache, start: usize, n: usize };
+
 /// `ids` at positions cache.len.. through the model: keys into the cache (len unmoved), logits out.
 pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, out: Out) !void {
+    const seg = [1]Seg{.{ .cache = cache, .start = out.start orelse cache.len, .n = ids.len }};
+    return runSegs(m, s, &seg, ids, out);
+}
+
+/// Several streams' decode windows in one forward (GLM_AX_BATCH): their rows concatenated in `ids`, each segment's
+/// keys into its own caches; every row's logits into s.logits_all (out.all), each segment's normed rows into its
+/// cache's `hidden` (out.hidden set, any buffer). Row-wise work (projections, experts) runs over all rows at once.
+pub fn runMany(m: *const Model, s: *st.Scratch, segs: []const Seg, ids: []const u32, out: Out) !void {
+    return runSegs(m, s, segs, ids, out);
+}
+
+fn runSegs(m: *const Model, s: *st.Scratch, segs: []const Seg, ids: []const u32, out: Out) !void {
+    const cache = segs[0].cache;
     if (!split_read) {
         split_rows = std.c.getenv("GLM_AX_SPLIT_ROWS") != null;
         if (std.c.getenv("GLM_AX_MM_FROM")) |v| mm_from = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 99;
@@ -346,16 +364,29 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
         c8 = std.c.getenv("GLM_AX_C8") != null;
         k4_rows = std.c.getenv("GLM_AX_K4_ROWS") != null;
         if (std.c.getenv("GLM_AX_MR_FROM")) |v| mr_from = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 99;
+        decode_nax = std.c.getenv("GLM_AX_DECODE_NAX") != null;
         split_read = true;
     }
     const c = &m.config;
     const n = ids.len;
-    const start = out.start orelse cache.len;
+    const start = segs[0].start;
     if (n == 0 or n > s.rows or (out.all and n > st.window_rows)) return error.GlmRowsExceeded;
-    if (start + n > cache.capacity or cache.capacity > s.capacity) return error.GlmContextFull;
+    if (segs.len > 1 and (n > st.window_rows or out.taps != null or out.pending != null)) return error.UnsupportedGlmBatch;
+    var total: usize = 0;
+    for (segs) |g| {
+        if (g.start + g.n > g.cache.capacity or g.cache.capacity > s.capacity) return error.GlmContextFull;
+        total += g.n;
+    }
+    if (total != n) return error.InvalidGlmBatch;
     for (ids) |id| if (id >= c.vocab) return error.InvalidGlmToken;
     if (out.pending == null) @memcpy(s.ids.slice(u32, n), ids);
-    rowTable(s, c, start, n);
+    if (segs.len == 1) rowTable(s, c, start, n) else {
+        var r0: usize = 0;
+        for (segs) |g| {
+            for (s.rowtab.slice(st.Row, n)[r0..][0..g.n], 0..) |*r, i| r.* = .{ .pos = @intCast(g.start + i), .list = @intCast((r0 + i) * c.i_topk) };
+            r0 += g.n;
+        }
+    }
     const h: usize = c.hidden;
     run_start = nowNs();
     const pool = mtl.objc.Pool.push();
@@ -367,7 +398,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     const W = m.weights;
     embed(x, n);
     for (W.layers[0..W.main], 0..) |l, i| {
-        try layer(&x, cache, l, i, start, n, i > 0, if (i + 1 < W.main) W.layers[i + 1].input_norm else null);
+        try layer(&x, segs, l, i, n, i > 0, if (i + 1 < W.main) W.layers[i + 1].input_norm else null);
         if (out.taps) |tb| if (m.tap_at[i] >= 0 and x.on()) {
             x.e.setPipeline(m.df[@intFromEnum(@import("dflash2.zig").Kernel.tap)]);
             x.e.setBuffer(s.resid, 0, 0);
@@ -378,10 +409,19 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     }
     try x.mark(.head);
     // the rows after the final norm: the head's input, and the draft head's (kept in `hidden` when asked for)
-    const normed = out.hidden orelse b(s.hid);
+    const normed = if (segs.len > 1) b(s.hid) else out.hidden orelse b(s.hid);
     if (out.head or out.hidden != null) {
         const w = W.norm orelse return error.GlmHasNoHead;
-        if (out.all or out.hidden != null) x.norm(b(s.resid), w, normed, n, 0, 0) else x.norm(bo(s.resid, (n - 1) * h * 4), w, bo(normed.buf, normed.off + (n - 1) * h * 2), 1, 0, 0);
+        if (segs.len > 1) {
+            // every row into s.hid (the head's input), and each segment's rows into its cache's hidden beside it
+            x.norm(b(s.resid), w, b(s.hid), n, 0, 0);
+            var r0: usize = 0;
+            for (segs) |g| {
+                x.beside();
+                x.norm(bo(s.resid, r0 * h * 4), w, b(g.cache.hidden), g.n, 0, 0);
+                r0 += g.n;
+            }
+        } else if (out.all or out.hidden != null) x.norm(b(s.resid), w, normed, n, 0, 0) else x.norm(bo(s.resid, (n - 1) * h * 4), w, bo(normed.buf, normed.off + (n - 1) * h * 2), 1, 0, 0);
     }
     if (out.head) {
         const head = W.head orelse return error.GlmHasNoHead;
@@ -423,7 +463,8 @@ pub fn mtp(m: *const Model, s: *st.Scratch, cache: *st.Cache, hidden: B, tokens:
     try x.project(head.eh, s.cat, 0, s.y, 0, n);
     x.glue(.widen, Args{ .rows = nr, .width = c.hidden }, &.{ b(s.resid), b(s.y), A }, .{ h, n, 1 }, .{ 256, 1, 1 }, false);
     const i = m.weights.main;
-    try layer(&x, cache, m.weights.layers[i], c.layers, start, n, false, null);
+    const seg = [1]Seg{.{ .cache = cache, .start = start, .n = n }};
+    try layer(&x, &seg, m.weights.layers[i], c.layers, n, false, null);
     x.norm(b(s.resid), head.norm, b(s.hid), n, 0, 0);
     try x.project(m.weights.head orelse return error.GlmHasNoHead, s.hid, (n - 1) * h * 2, s.logits_all, 0, 1);
     try finish(x);
@@ -473,7 +514,7 @@ fn finish(x: Enc) !void {
 /// Decoder layer `l` with cache slot `i` over rows at positions start..: attention, then the MLP or the experts.
 /// `normed`: s.x already holds the rows after this layer's input norm (the layer before fused it); `next`: the
 /// following layer's input norm, fused into this layer's last residual add (null: a plain add).
-fn layer(x: *Enc, cache: *st.Cache, l: wts.Layer, i: usize, start: usize, n: usize, normed: bool, next: ?wts.Tensor) !void {
+fn layer(x: *Enc, segs: []const Seg, l: wts.Layer, i: usize, n: usize, normed: bool, next: ?wts.Tensor) !void {
     const m = x.m;
     const s = x.s;
     const c = &m.config;
@@ -481,7 +522,7 @@ fn layer(x: *Enc, cache: *st.Cache, l: wts.Layer, i: usize, start: usize, n: usi
     const nr: u32 = @intCast(n);
     try x.mark(.norm);
     if (!normed) x.norm(b(s.resid), l.input_norm, b(s.x), n, 0, 0);
-    try attention(x, cache, l.attn, i, start, n);
+    try attention(x, segs, l.attn, i, n);
     try x.mark(.norm);
     x.own(.add_norm, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.resid), b(s.y), t(l.post_norm), A, b(s.x) }, .{ n, 1, 1 }, .{ norm_threads, 1, 1 }, true);
     switch (l.ffn) {
@@ -666,7 +707,7 @@ fn mlp(x: Enc, w: wts.Mlp, s: *st.Scratch, out: mtl.Buffer, n: usize, inter: u32
 
 /// MLA of the normed rows s.x into s.y: keys into the layer's cache, a full layer's key lists, attention in latent
 /// space over each row's list, the per-head output maps and o_proj.
-fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize, n: usize) !void {
+fn attention(x: *Enc, segs: []const Seg, w: wts.Attention, i: usize, n: usize) !void {
     const m = x.m;
     const s = x.s;
     const c = &m.config;
@@ -674,16 +715,36 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
     const nh: usize = c.heads;
     const qk: usize = c.qHead();
     const rt = @sizeOf(st.Row);
+    // a single stream (any rows) or several streams' decode rows: the per-stream steps below loop over segments
+    const cache = segs[0].cache;
+    const start = segs[0].start;
     const keys = bo(cache.kv, cache.keys(i));
+    const many = segs.len > 1;
     try x.mark(.proj_x);
     // q_a, kv_a and a full layer's wk and weights_proj in one product: a row of px columns
     try x.project(w.x, s.x, 0, s.qa, 0, n);
     const px: usize = std.mem.alignForward(usize, w.x.n, if (n > st.window_rows) 64 else 1);
     const ga = GArgs{ .rows = nr, .heads = c.heads, .in_stride = @intCast(px), .eps = mla_eps, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(qk))), .score_stride = @intCast(s.capacity), .key_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.i_dim))), .head_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.i_heads))) };
     try x.mark(.prep);
-    x.own(.prep, ga, &.{ b(s.qa), bo(s.qa, wts.kv_col * 2), t(w.q_norm), t(w.kv_norm), b(m.inv), b(s.rowtab), A, b(s.qr), keys }, .{ n, 1, 1 }, .{ 256, 1, 1 }, true);
-    if (w.indexer != null) x.beside();
-    if (w.indexer) |ix| x.own(.index_key, ga, &.{ bo(s.qa, wts.wk_col * 2), t(ix.k_norm), t(ix.k_bias), b(m.inv), b(s.rowtab), A, bo(cache.index, cache.indexKeys(i)) }, .{ n, 1, 1 }, .{ 32, 1, 1 }, true);
+    if (!many) {
+        x.own(.prep, ga, &.{ b(s.qa), bo(s.qa, wts.kv_col * 2), t(w.q_norm), t(w.kv_norm), b(m.inv), b(s.rowtab), A, b(s.qr), keys }, .{ n, 1, 1 }, .{ 256, 1, 1 }, true);
+        if (w.indexer != null) x.beside();
+        if (w.indexer) |ix| x.own(.index_key, ga, &.{ bo(s.qa, wts.wk_col * 2), t(ix.k_norm), t(ix.k_bias), b(m.inv), b(s.rowtab), A, bo(cache.index, cache.indexKeys(i)) }, .{ n, 1, 1 }, .{ 32, 1, 1 }, true);
+    } else {
+        var r0: usize = 0;
+        for (segs, 0..) |g, k| {
+            var a = ga;
+            a.rows = @intCast(g.n);
+            const qa0 = r0 * px * 2;
+            if (k > 0) x.beside();
+            x.own(.prep, a, &.{ bo(s.qa, qa0), bo(s.qa, qa0 + wts.kv_col * 2), t(w.q_norm), t(w.kv_norm), b(m.inv), bo(s.rowtab, r0 * rt), A, bo(s.qr, r0 * c.q_lora * 2), bo(g.cache.kv, g.cache.keys(i)) }, .{ g.n, 1, 1 }, .{ 256, 1, 1 }, true);
+            if (w.indexer) |ix| {
+                x.beside();
+                x.own(.index_key, a, &.{ bo(s.qa, qa0 + wts.wk_col * 2), t(ix.k_norm), t(ix.k_bias), b(m.inv), bo(s.rowtab, r0 * rt), A, bo(g.cache.index, g.cache.indexKeys(i)) }, .{ g.n, 1, 1 }, .{ 32, 1, 1 }, true);
+            }
+            r0 += g.n;
+        }
+    }
     try x.mark(.proj_q);
     try x.project(w.q_b, s.qr, 0, s.q, 0, n);
     // decode rows only: a prompt chunk's projection is row sums then a GEMM over them, one sums buffer for both
@@ -692,9 +753,35 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
     if (w.indexer != null) {
         try x.mark(.index);
         const iq_row: usize = @as(usize, c.i_heads) * c.i_dim * 2;
-        const nax = n > st.window_rows and start + n > c.i_topk;
+        const nax = (n > st.window_rows or (decode_nax and !many)) and start + n > c.i_topk;
+        const nax_sgs: usize = if (n > st.window_rows) 4 else 1;
         if (nax) x.own(.index_qrope, ga, &.{ b(s.iq), b(s.rowtab), b(m.inv), A, b(s.iqr) }, .{ c.i_heads * 64, n, 1 }, .{ 256, 1, 1 }, false);
         var r0: usize = 0;
+        if (many) {
+            // each segment's rows score its own index keys (score rows at the segment's rows), then its top-k
+            var g0: usize = 0;
+            for (segs, 0..) |g, k| {
+                var a = ga;
+                a.rows = @intCast(g.n);
+                const last = g.start + g.n - 1;
+                if (last >= c.i_topk) {
+                    if (k > 0) x.beside();
+                    x.own(.index_scores, a, &.{ bo(s.iq, g0 * iq_row), bo(s.qa, (g0 * px + wts.wp_col) * 2), bo(g.cache.index, g.cache.indexKeys(i)), bo(s.rowtab, g0 * rt), A, bo(s.score, g0 * s.capacity * 4), b(m.inv) }, .{ last / 256 + 1, g.n, 1 }, .{ 128, 1, 1 }, true);
+                }
+                g0 += g.n;
+            }
+            try x.mark(.topk);
+            g0 = 0;
+            for (segs, 0..) |g, k| {
+                var a = ga;
+                a.rows = @intCast(g.n);
+                if (k > 0) x.beside();
+                x.own(.index_topk, a, &.{ bo(s.score, g0 * s.capacity * 4), bo(s.rowtab, g0 * rt), A, b(s.keys) }, .{ g.n, 1, 1 }, .{ 1024, 1, 1 }, true);
+                g0 += g.n;
+            }
+            try x.mark(.index);
+            r0 = n;
+        }
         while (r0 < n) : (r0 += st.score_rows) {
             const blk: usize = @min(st.score_rows, n - r0);
             const last = start + r0 + blk - 1;
@@ -710,7 +797,7 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
                     x.e.setBuffer(s.score, 0, 3);
                     x.e.setValue(ScoreArgs{ .p0 = @intCast(start + r0), .q_stride = c.i_heads * c.i_dim, .w_stride = @intCast(px), .s_stride = @intCast(s.capacity), .rows = @intCast(blk), .wscale = ga.head_scale * ga.key_scale }, 4);
                     // 4 simdgroups: 64 rows a threadgroup, the block's rows in one row tile
-                    x.e.dispatchGroups(mtl.Size.of(last / 64 + 1, (blk + 63) / 64, 1), mtl.Size.of(128, 1, 1));
+                    x.e.dispatchGroups(mtl.Size.of(last / 64 + 1, (blk + 16 * nax_sgs - 1) / (16 * nax_sgs), 1), mtl.Size.of(32 * nax_sgs, 1, 1));
                 }
             } else if (last >= c.i_topk) x.own(.index_scores, a, &.{ bo(s.iq, r0 * iq_row), bo(s.qa, (r0 * px + wts.wp_col) * 2), bo(cache.index, cache.indexKeys(i)), bo(s.rowtab, r0 * rt), A, b(s.score), b(m.inv) }, .{ last / 256 + 1, blk, 1 }, .{ 128, 1, 1 }, true);
             try x.mark(.topk);
@@ -767,6 +854,46 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
             x.e.setBuffer(s.olat, 0, 5);
             x.e.dispatchGroups(mtl.Size.of(nh / 16, n, 1), mtl.Size.of(128, 1, 1));
         };
+    } else if (many) {
+        // several streams' rows: each segment's split over its own keys, then its merge (blocks per segment)
+        const bs: usize = st.attn_blocks * nh;
+        var r0: usize = 0;
+        for (segs, 0..) |g, k| {
+            const width: usize = @min(c.i_topk, g.start + g.n);
+            const span: usize = @max(32, std.mem.alignForward(usize, (width + st.attn_blocks - 1) / st.attn_blocks, 32));
+            const blocks: usize = (width + span - 1) / span;
+            if (k > 0) x.beside();
+            if (x.on()) {
+                x.e.setPipeline(m.sparse_split);
+                x.e.setBuffer(s.qlat, r0 * nh * qw * 2, 0);
+                x.e.setBuffer(g.cache.kv, g.cache.keys(i), 1);
+                x.e.setBuffer(s.keys, r0 * c.i_topk * 4, 2);
+                x.e.setValue(ga.scale, 3);
+                x.e.setValue([4]i32{ @intCast(c.i_topk), @intCast(g.start + g.n), @intCast(span), @intCast(g.start) }, 4);
+                x.e.setBuffer(s.po, r0 * bs * c.kv_lora * 4, 5);
+                x.e.setBuffer(s.pm, r0 * bs * 4, 6);
+                x.e.setBuffer(s.pl, r0 * bs * 4, 7);
+                x.e.dispatchGroups(mtl.Size.of(nh / 16, blocks, g.n), mtl.Size.of(128, 1, 1));
+            }
+            r0 += g.n;
+        }
+        r0 = 0;
+        for (segs, 0..) |g, k| {
+            const width: usize = @min(c.i_topk, g.start + g.n);
+            const span: usize = @max(32, std.mem.alignForward(usize, (width + st.attn_blocks - 1) / st.attn_blocks, 32));
+            const blocks: usize = (width + span - 1) / span;
+            if (k > 0) x.beside();
+            if (x.on()) {
+                x.e.setPipeline(m.sparse_combine);
+                x.e.setBuffer(s.po, r0 * bs * c.kv_lora * 4, 0);
+                x.e.setBuffer(s.pm, r0 * bs * 4, 1);
+                x.e.setBuffer(s.pl, r0 * bs * 4, 2);
+                x.e.setValue(@as(i32, @intCast(blocks)), 3);
+                x.e.setBuffer(s.olat, r0 * nh * c.kv_lora * 2, 4);
+                x.e.dispatchGroups(mtl.Size.of(nh, g.n, 1), mtl.Size.of(128, 1, 1));
+            }
+            r0 += g.n;
+        }
     } else if (std.c.getenv("GLM_AX_OLD_ATTN") == null) {
         // decode rows: each row's key list in attn_blocks blocks on the tensor units, then the blocks merged
         const width: usize = @min(c.i_topk, start + n); // the longest list a row of the window has
@@ -820,7 +947,7 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
         }
     }
     try x.mark(.unembed);
-    const fused_unembed = fuse_unembed and std.c.getenv("GLM_AX_OLD_ATTN") == null;
+    const fused_unembed = fuse_unembed and !many and std.c.getenv("GLM_AX_OLD_ATTN") == null;
     if (!fused_unembed) x.heads(w.unembed, s.olat, c.kv_lora, s.o, c.v_dim, n, nh);
     try x.mark(.o_proj);
     try x.project(w.o, s.o, 0, s.y, 0, n);

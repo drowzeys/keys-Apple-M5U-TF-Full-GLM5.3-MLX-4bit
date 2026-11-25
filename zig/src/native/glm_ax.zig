@@ -108,6 +108,10 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
             model.deinit();
             return null;
         };
+        if (std.c.getenv("GLM_AX_DUAL")) |v| if (v[0] == '1') {
+            h.dspark.?.mtp = h.metal;
+            std.log.info("glm_ax: GLM_AX_DUAL=1: each stream's rounds drafted by DSpark or the MTP head, whichever measures more tokens a ms", .{});
+        };
         h.wrap = try lanes.drafted.Drafted.init(gpa, h.metal.backend(), h.dspark.?.drafter());
     };
     errdefer if (h.wrap) |*w| w.deinit();
@@ -119,13 +123,13 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, if (h.wrap) |*w| w.backend() else h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = s5.state.prompt_rows, .decode_share = o.decode_share, .structures = true, .logprobs = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = @intCast(s5.state.prompt_rows), .decode_share = o.decode_share, .structures = true, .logprobs = true });
     h.cache = null;
     h.cache_cap = if (o.prompt_cache_gib) |g| @intFromFloat(g * (1 << 30)) else budget;
     if (h.cache_cap > 0) {
         const M = s5.backend.Metal;
         // the MTP head keys row at-1 with token at; prompt chunks change arithmetic with their rows
-        const rules: api.prompt_cache.Rules = .{ .lookahead = @intFromBool(model.config.mtp > 0), .planned = true, .grid = s5.state.prompt_rows, .min_prompt = 0 };
+        const rules: api.prompt_cache.Rules = .{ .lookahead = @intFromBool(model.config.mtp > 0), .planned = true, .grid = @intCast(s5.state.prompt_rows), .min_prompt = 0 };
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h.metal, .vtable = &.{ .bytes = M.snapBytes, .save = M.snapSave, .restore = M.snapRestore, .drop = M.snapDrop } }, rules, @min(h.cache_cap, budget));
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;

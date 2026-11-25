@@ -84,6 +84,9 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+var top_picks: [1 << 18]u32 = undefined;
+var top_n: usize = 0;
+
 fn once(m: *g.Model, io: std.Io, t: *const tok.Tokenizer, scratch: *g.state.Scratch, big: *g.state.Scratch, cache: *g.state.Cache, prompt: []const u32, max: usize) !void {
     const c = &m.config;
     const forced = platform.c.getenv("GLM_FORCED") != null;
@@ -92,6 +95,7 @@ fn once(m: *g.Model, io: std.Io, t: *const tok.Tokenizer, scratch: *g.state.Scra
     const head = m.weights.head != null;
     cache.len = 0;
     var agree: usize = 0;
+    top_n = 0;
     var pprof: g.forward.Profile = .{};
     const t0 = std.Io.Timestamp.now(io, .awake);
     var at: usize = 0;
@@ -108,6 +112,10 @@ fn once(m: *g.Model, io: std.Io, t: *const tok.Tokenizer, scratch: *g.state.Scra
         }
         if (forced) for (0..n) |r| {
             const pick = argmax(s.logits_all.slice(u16, n * c.vocab)[r * c.vocab ..][0..c.vocab]);
+            if (top_n < top_picks.len) {
+                top_picks[top_n] = pick;
+                top_n += 1;
+            }
             if (at + r + 1 < prompt.len and pick == prompt[at + r + 1]) agree += 1;
             if (r + 1 == n) @memcpy(cache.logits.slice(u16, c.vocab), s.logits_all.slice(u16, n * c.vocab)[r * c.vocab ..][0..c.vocab]);
         };
@@ -122,6 +130,11 @@ fn once(m: *g.Model, io: std.Io, t: *const tok.Tokenizer, scratch: *g.state.Scra
     std.debug.print("\n", .{});
     if (profiling) report("prompt", &pprof, prompt.len);
     if (env("GLM_PBENCH", 0) > 0 and prompt.len >= g.state.prompt_rows) try pbench(m, big, cache, prompt, @intCast(env("GLM_PBENCH", 0)));
+    // GLM_TOPDUMP=<file> (with GLM_FORCED): every row's top-1 token as u32 (two runs' files compared: top-1 agreement)
+    if (platform.c.getenv("GLM_TOPDUMP")) |path| {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(path), .data = std.mem.sliceAsBytes(top_picks[0..top_n]) });
+        std.debug.print("dumped {d} rows' top-1 to {s}\n", .{ top_n, std.mem.span(path) });
+    }
     if (platform.c.getenv("GLM_DUMP")) |path| {
         const bytes = last_s.resid.contents()[0 .. last_n * c.hidden * 4];
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(path), .data = bytes });

@@ -12,6 +12,9 @@ const frags = @import("../../core/frags.zig");
 const file_cache = @import("../../core/checkpoint_file_cache.zig");
 const weights = @import("weights.zig");
 const dflash2 = @import("dflash2.zig");
+const st_k8 = @import("state.zig");
+/// GLM_AX_K8=1: the caches' kernels built with GX_K8 (8-bit rows), prepended to their sources
+var k8_define: []const u8 = "";
 /// The GLM-5.3-Flash family's column-group products (core affine_mm's bits, faster): prompt experts and deep products.
 pub const mm_groups = @import("../glm/mm_groups.zig");
 const lanes = @import("lanes");
@@ -80,6 +83,19 @@ pub const Model = struct {
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options) !*Model {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
+        // GLM_AX_K8=1: both caches 8-bit; =lat: the latent cache only; =idx: the index cache only
+        const k8v: []const u8 = if (std.c.getenv("GLM_AX_K8")) |v| std.mem.span(v) else "";
+        st_k8.k8 = std.mem.eql(u8, k8v, "1") or std.mem.eql(u8, k8v, "lat");
+        st_k8.k8i = std.mem.eql(u8, k8v, "1") or std.mem.eql(u8, k8v, "idx");
+        if (st_k8.k8 and std.c.getenv("GLM_AX_OLD_ATTN") != null) return error.GlmK8NeedsSplitAttention;
+        k8_define = if (st_k8.k8 and st_k8.k8i) "#define GX_K8 1\n#define GX_K8I 1\n" else if (st_k8.k8) "#define GX_K8 1\n" else if (st_k8.k8i) "#define GX_K8I 1\n" else "";
+        if (std.c.getenv("GLM_AX_PROMPT_ROWS")) |v| {
+            const r = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadGlmPromptRows;
+            if (r < 1024 or r > st_k8.prompt_rows_max or r % 64 != 0) return error.BadGlmPromptRows;
+            st_k8.prompt_rows = r;
+            std.log.info("glm_ax: GLM_AX_PROMPT_ROWS={d}: prompt chunks of {d} rows", .{ r, r });
+        }
+        if (st_k8.k8 or st_k8.k8i) std.log.info("glm_ax: GLM_AX_K8={s}: 8-bit {s} cache, a half scale a 64-wide group", .{ k8v, if (st_k8.k8 and st_k8.k8i) "latent and index" else if (st_k8.k8) "latent" else "index" });
         const t0 = std.Io.Timestamp.now(io, .awake);
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
@@ -137,7 +153,9 @@ pub const Model = struct {
         errdefer m.weights.deinit(gpa);
         m.checkpoint.closeFiles();
         {
-            const lib = try mtl.Library.fromSource(m.device, ks.glm_ax, mtl.CompileOptions.mlx());
+            const src = try std.mem.concat(gpa, u8, &.{ k8_define, ks.glm_ax });
+            defer gpa.free(src);
+            const lib = try mtl.Library.fromSource(m.device, src, mtl.CompileOptions.mlx());
             defer lib.deinit();
             var made: usize = 0;
             errdefer for (m.own[0..made]) |p| p.deinit();
@@ -191,7 +209,9 @@ pub const Model = struct {
         }
         errdefer for (m.mm) |p| p.deinit();
         {
-            const text = try frags.source(m.device, gpa, ks.glm_ax_sparse);
+            const text0 = try frags.source(m.device, gpa, ks.glm_ax_sparse);
+            defer gpa.free(text0);
+            const text = try std.mem.concat(gpa, u8, &.{ k8_define, text0 });
             defer gpa.free(text);
             const lib = try mtl.Library.fromSource(m.device, text, mtl.CompileOptions.mlx());
             defer lib.deinit();
@@ -227,7 +247,9 @@ pub const Model = struct {
         errdefer if (m.mmg) |pp| for (pp) |x| x.deinit();
         m.sparse_mpp = null;
         if (std.c.getenv("GLM_AX_NO_MPP") == null) {
-            const lib = try mtl.Library.fromSource(m.device, ks.glm_ax_mpp, mtl.CompileOptions.mlx());
+            const src = try std.mem.concat(gpa, u8, &.{ k8_define, ks.glm_ax_mpp });
+            defer gpa.free(src);
+            const lib = try mtl.Library.fromSource(m.device, src, mtl.CompileOptions.mlx());
             defer lib.deinit();
             m.sparse_mpp = try mtl.Pipeline.init(m.device, lib, "gx_sparse_mpp", false);
         }

@@ -28,7 +28,7 @@ fn stack(c: *const cfg.Config) usize {
 /// Bytes a state after `at` prompt tokens takes.
 pub fn bytes(c: *const cfg.Config, at: usize) u64 {
     var total: u64 = 0;
-    for (0..stack(c)) |i| total += at * (st.key_bytes + if (c.full.isSet(i)) @as(u64, st.index_bytes) else 0);
+    for (0..stack(c)) |i| total += at * (st.keyBytes() + if (c.full.isSet(i)) @as(u64, st.indexBytes()) else 0);
     return total;
 }
 
@@ -59,11 +59,11 @@ fn copy(queue: mtl.Queue, c: *const cfg.Config, cache: *const st.Cache, buf: mtl
     const e = cb.blit();
     var at: usize = 0;
     for (0..stack(c)) |i| {
-        const kn = cache.len * st.key_bytes;
+        const kn = cache.len * st.keyBytes();
         if (out) e.copy(cache.kv, cache.keys(i), buf, at, kn) else e.copy(buf, at, cache.kv, cache.keys(i), kn);
         at += kn;
         if (!c.full.isSet(i)) continue;
-        const in = cache.len * st.index_bytes;
+        const in = cache.len * st.indexBytes();
         if (out) e.copy(cache.index, cache.indexKeys(i), buf, at, in) else e.copy(buf, at, cache.index, cache.indexKeys(i), in);
         at += in;
     }

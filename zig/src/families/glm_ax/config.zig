@@ -5,7 +5,7 @@ const dsa = @import("../glm_dsa/config.zig");
 pub const Config = dsa.Config;
 pub const max_layers = dsa.max_layers;
 /// The longest context the engine serves.
-pub const max_context = 262144;
+pub const max_context = 1048576; // the checkpoint's max_position_embeddings (was 262144)
 
 pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
