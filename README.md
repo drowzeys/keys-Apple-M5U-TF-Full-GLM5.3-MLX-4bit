@@ -14,8 +14,8 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 - MTP drafts plus context-copy drafts, verified in one pass, through TensorFold's OpenAI-compatible server. The
   default is two MTP drafts with a confidence cut (best for code and edits); prose is best at one draft. Opt-in:
   the DFlash2 and DSpark drafters.
-- One stream at a time (`--parallel 1`); served and checked up to about 77k tokens of context (78k with the load
-  limit used here).
+- One stream at a time (`--parallel 1`); answers checked up to about 255k tokens of context (256k with
+  `GLM_AX_LOAD_LIMIT_GB=470`; 78k with the 440 used for the benchmarks).
 
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
@@ -152,7 +152,7 @@ sampling `vm_stat` every second:
 - A needle at 50% depth was found at both lengths: 110.7 s for 71,144 tokens (about 643 tok/s) and 117.0 s for
   76,687 tokens (about 655 tok/s), including the MTP layer's pass over the prompt.
 - The KV and index caches take about 96.6 KB a token. With `GLM_AX_LOAD_LIMIT_GB=440` the largest `--context` the
-  server accepts is 78,601 tokens; longer contexts need a higher limit, which has not been measured.
+  server accepts is 78,601 tokens; longer contexts need a higher limit (470 for 256k, see below).
 - Weights: 389.6 GiB without the MTP head, 394.8 GiB with it. At the 32k context used for the benchmarks, the
   caches took 11-17 GiB on earlier builds.
 - The Mac's GPU wired-memory limit has to be raised above the default, for example:
@@ -165,7 +165,35 @@ sampling `vm_stat` every second:
   macOS, the machine can stall or reboot. Close other large programs first, and a memory watchdog (a script that
   stops the server when free memory drops below a few GB) is recommended. The setting resets at reboot.
 - `GLM_AX_LOAD_LIMIT_GB=440` raises the engine's own load limit (default 75% of RAM, too low for this model).
-- A 512 GB Mac is required in practice (about 420 GB free for a 78k context). Loading takes about 40 s from a warm file cache.
+- A 512 GB Mac is required in practice: about 420 GB free for a 78k context, about 440 GB for 256k. Loading
+  takes about 40 s from a warm file cache.
+
+### Long context (up to 256k tokens)
+
+**Up to 256k tokens of context with `GLM_AX_LOAD_LIMIT_GB=470` and `--context 262144`; peak wired 432 GiB at a
+255k prompt (about 440 GB free needed); prefill 617 tok/s at 128k, 534 at 255k.**
+
+Same v0.2.1 build and binary, only the flags change:
+
+```sh
+GLM_AX_LOAD_LIMIT_GB=470 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off \
+  ./zig-out/native/bin/tensorfold-native serve /path/to/GLM-5.3-4bit-MTP \
+  --name glm53 --host 127.0.0.1 --port 8020 \
+  --context 262144 --parallel 1 --reasoning-effort low --no-update-check
+```
+
+Measured with `--prompt-cache-gib 0`. After load: 394.8 GiB of weights plus 35.0 GiB of caches. A needle at 50%
+depth was found at each length:
+
+| Prompt | First token | Prompt rate | Wired after the prompt |
+|---:|---:|---:|---:|
+| 63,355 tokens | 98.0 s | 647 tok/s | 414.2 GiB |
+| 127,800 tokens | 207.1 s | 617 tok/s | 420.0 GiB |
+| 255,439 tokens | 478.4 s | 534 tok/s | 431.5 GiB |
+
+Peak wired memory was 431.7 GiB; the compressor stayed flat at 0.71 GiB, free memory never went below 60.9 GiB,
+and the whole machine stayed under 500 GB. Decode speed at 128k and 256k has not been measured yet: the needle
+replies were only about 10 tokens.
 
 ## Get the weights
 
@@ -276,9 +304,9 @@ The scripts use only the Python standard library.
 ## Limitations
 
 - Single stream only (`--parallel 1`).
-- Decode speed was measured through the server up to about 21k tokens of context; answers (needles) and memory up
-  to about 77k tokens, prompt rate to 78k. Contexts beyond 78.6k need a load limit above 440 GB and were not
-  measured.
+- Decode speed was measured through the server up to about 21k tokens of context; answers (needles), memory and
+  prompt rate up to about 255k tokens. Decode speed at 128k and 256k has not been measured yet. Contexts beyond
+  256k were not tried.
 - Not bit-identical to MLX (summation order), see above.
 - The DFlash2 drafter path is in the code but not benchmarked for this README; the DSpark row comes from an
   earlier build (tf32).
