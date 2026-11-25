@@ -13,7 +13,8 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 - Metal kernels using the M5 GPU's tensor units for prompt processing and decode attention.
 - MTP drafts plus context-copy drafts, verified in one pass, through TensorFold's OpenAI-compatible server.
   Opt-in: a confidence cut for deeper MTP drafts, and the DFlash2 and DSpark drafters.
-- One stream at a time (`--parallel 1`); measured up to about 21k tokens of context.
+- One stream at a time (`--parallel 1`); served and checked up to about 21k tokens of context, prompt rate measured
+  to 78k.
 
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
@@ -42,16 +43,20 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 
 | Build | Drafts (settings) | Prose, T=0.6 | Prose, greedy | Code, greedy | Edit, greedy | Prose at ~16k context |
 |---|---|---:|---:|---:|---:|---:|
-| **v0.2.0 (tf33)** | MTP, depth 1 (`GLM_AX_DRAFT_DEPTH=1`) | **36.5** | **36.6** | **38.6** | **38.5** | **33.0** |
-| v0.2.0 (tf33), option | MTP, depth 2 + confidence cut (`GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7`) | 35.1 | 36.4 | 40.1 | 42.0 | 32.6 |
+| **v0.2.0 release binary** | MTP, depth 1 (`GLM_AX_DRAFT_DEPTH=1`) | **36.0** | **37.9** | **39.8** | **40.0** | - |
+| **v0.2.0 release binary**, option | MTP, depth 2 + confidence cut (`GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7`) | **35.7** | **38.2** | **42.4** | **42.7** | - |
+| v0.2.0 source (tf33) as first benchmarked | MTP, depth 1 | 36.5 | 36.6 | 38.6 | 38.5 | 33.0 |
+| v0.2.0 source (tf33) as first benchmarked, option | MTP, depth 2 + confidence cut | 35.1 | 36.4 | 40.1 | 42.0 | 32.6 |
 | earlier build, option | DSpark (`GLM_AX_DSPARK=<dir>`, `GLM_AX_DSPARK_FLOOR=0.5`) | 30.9 | 32.4 | 43.0 | 49.8 | - |
 | v0.1.0 binary (tf16) | MTP, depth 1 | 36.3 | 37.4 | 40.2 | 35.1 | - |
 | tf16 as first benchmarked (fused unembed on) | MTP, depth 1 | 35.8 | 37.1 | 39.3 | 34.0 | - |
 | tf15 | MTP, depth 1 | 35.4 | 37.3 | 39.5 | 33.7 | 33.3 |
 | tf15 | none | 29.4 | 30.0 | 29.9 | - | - |
 
-- At default settings v0.2.0 decodes prose level with v0.1.0 (36.5 against 36.3 tok/s at T=0.6) and code about 4%
-  lower (38.6 against 40.2); edits are faster (38.5 against 35.1). The gain of this release is prompt processing.
+- The release-binary rows are medians of 2 runs (`RUNS=2`), the tf33 rows of 3.
+- At default settings v0.2.0 decodes prose level with v0.1.0 (36.5 / 36.0 against 36.3 tok/s at T=0.6) and code
+  slightly lower (38.6 / 39.8 against 40.2, up to 4%); edits are faster (38.5 / 40.0 against 35.1). The gain of
+  this release is prompt processing.
 - For code- and edit-heavy use, `GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7` is recommended: a second MTP draft is
   offered only while the head's running confidence stays at or above 0.7. A later build makes this the default;
   in this release it is opt-in (unset, the floor is off and the depth is 3).
@@ -63,22 +68,33 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 
 ### Prompt processing (first-token rate, prompt cache off)
 
-| Prompt | v0.2.0, no drafts | v0.2.0, MTP server | same family on v1.3.5 without the prefill changes | v0.1.0 (tf16), no drafts |
-|---:|---:|---:|---:|---:|
-| 1,284 tokens | **706 tok/s** (+10%) | 606 tok/s | 640 tok/s | 667 tok/s |
-| 4,941 tokens | **718 tok/s** (+27%) | 675 tok/s | 566 tok/s | 593 tok/s |
-| 19,611 tokens | **707 tok/s** (+37%) | 668 tok/s | 516 tok/s | 570 tok/s |
+| Prompt | v0.2.0 (tf33), no drafts | v0.2.0 release binary, MTP server | v0.2.0 (tf33), MTP server | same family on v1.3.5 without the prefill changes | v0.1.0 (tf16), no drafts |
+|---:|---:|---:|---:|---:|---:|
+| 1,284 tokens | **706 tok/s** (+10%) | 682 tok/s | 606 tok/s | 640 tok/s | 667 tok/s |
+| 4,941 tokens | **718 tok/s** (+27%) | 700 tok/s | 675 tok/s | 566 tok/s | 593 tok/s |
+| 19,611 tokens | **707 tok/s** (+37%) | 681 tok/s | 668 tok/s | 516 tok/s | 570 tok/s |
 
 Percentages are against the v1.3.5 base column. The rate is prompt tokens / time to the first token (it includes
 tokenizing and one decode pass). With the prompt cache on (the server's default), a follow-up turn of the same
 conversation started in about 0.34 s on an earlier build instead of reprocessing the whole conversation.
+
+Prompt rate against context length, without the server (`tf-glm-ax-run`, tf33, one fresh prompt each):
+
+| Prompt | 1.3k | 4.9k | 9.9k | 19.6k | 39k | 78k |
+|---|---:|---:|---:|---:|---:|---:|
+| tok/s | 734 | 727 | 721 | 711 | 684 | 624 |
 
 Whole decode step without the server (`tf-glm-ax-run`, tf16): 33.9 ms on the GPU at 422 tokens of context
 (22.25 GB read a step, 657 GB/s), 38.5 ms at 19.6k tokens.
 
 ### Correctness checks
 
-v0.2.0 (tf33):
+v0.2.0 release binary (the published asset, run on the model after publishing):
+- SHA-256 matched; Canberra passed; a needle at 90% of a 21,125-token prompt was found (first answer after 32.8 s).
+- A greedy essay was byte-identical to tf33's undrafted output, both at the default settings and with
+  `GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7`.
+
+v0.2.0 source (tf33):
 - Known answer: "What is the capital city of Australia?" gives "Canberra".
 - Needle retrieval: codes hidden in about 6k tokens, and at 10% and 90% of about 20k tokens, were all returned
   exactly; through the server, a needle at 90% of a 21,125-token prompt was found.
@@ -153,7 +169,8 @@ toolchain) as a .tar.gz with its SHA-256, plus the licence files. It needs macOS
 built with). It is ad-hoc signed, not notarized: after downloading, run
 `xattr -d com.apple.quarantine tensorfold-native`. No weights are included. The
 [v0.1.0 release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp)
-stays available (its source is commit `7446f69`).
+stays available (its source is commit `7446f69`). The v0.2.0 binary was run on the model after publishing; see
+Results.
 
 ## Serve
 
@@ -207,8 +224,8 @@ The scripts use only the Python standard library.
 ## Limitations
 
 - Single stream only (`--parallel 1`).
-- Measured up to about 21k tokens of context; longer contexts (up to the 32k the server was started with, or
-  beyond) were not measured.
+- Decode and correctness were measured through the server up to about 21k tokens of context; the prompt rate was
+  measured to 78k tokens without the server. Decode and answers at longer contexts were not measured.
 - Not bit-identical to MLX (summation order), see above.
 - The DFlash2 drafter path is in the code but not benchmarked for this README; the DSpark row comes from an
   earlier build.
