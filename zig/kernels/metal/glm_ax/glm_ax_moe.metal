@@ -197,3 +197,277 @@ inline int gx_members(uint u, constant gx_moe_set_args& a, const device int* lco
     m += take;
   }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Verify windows' projections (2-8 rows a pass) with each weight read once a pass: a lane keeps its 4 columns' 16
+// codes of a 512-wide chunk in registers and runs the window's rows over them two at a time, with the core's own
+// load16 and the qdot16 arithmetic, so every row's sums are the one-row kernel's bit for bit (core/row_projection.metal
+// tf_rp_rows_at with MB 2, whose pairs read the weights again for every pair). 4-bit, groups of 64.
+// dims: K, N, GS, rows; X [rows, K]; W [N, K/8] words; S, B [N, K/GS]; OUT [rows, N]. Grid (N / 8), 64 threads.
+inline void gx_qdot16_codes(const thread uint16_t* ws, const thread float (*xt)[16], float scale, float bias,
+                            const thread float* sum, thread float* out) {
+  float q[16];
+  for (int i = 0; i < 4; i++) {
+    const int v = ws[i];
+    q[4 * i] = float(v & 0x000f); q[4 * i + 1] = float(v & 0x00f0); q[4 * i + 2] = float(v & 0x0f00); q[4 * i + 3] = float(v & 0xf000);
+  }
+  for (int b = 0; b < 2; b++) {
+    float accum = 0.0f;
+    for (int i = 0; i < 4; i++)
+      accum += (tf_rp_in<4>(xt[b][4 * i], 4 * i) * q[4 * i] + tf_rp_in<4>(xt[b][4 * i + 1], 4 * i + 1) * q[4 * i + 1] +
+                tf_rp_in<4>(xt[b][4 * i + 2], 4 * i + 2) * q[4 * i + 2] +
+                tf_rp_in<4>(xt[b][4 * i + 3], 4 * i + 3) * q[4 * i + 3]);
+    out[b] += scale * accum + sum[b] * bias;
+  }
+}
+
+constant constexpr int GXMR = 8; // rows a pass over the weights
+
+[[kernel]] void gx_rows_mr(const device bfloat* X [[buffer(0)]], const device uint32_t* W [[buffer(1)]],
+                           const device bfloat* S [[buffer(2)]], const device bfloat* B [[buffer(3)]],
+                           constant int* dims [[buffer(4)]], device bfloat* OUT [[buffer(5)]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                           uint3 tg [[threadgroup_position_in_grid]]) {
+  const int K = dims[0], N = dims[1], GS = dims[2], rows = dims[3];
+  const int row0 = (int(tg.x) * 2 + int(sg)) * 4;
+  if (row0 >= N) return;
+  const int KB = K * 4 / 8, KG = K / GS, FULL = K / 512 * 512, per_lane = GS / 16;
+  for (int m0 = 0; m0 < rows; m0 += GXMR) {
+    const int mr = min(GXMR, rows - m0);
+    float acc[GXMR][4];
+    for (int b = 0; b < GXMR; b++)
+      for (int j = 0; j < 4; j++) acc[b][j] = 0.0f;
+    const device uint8_t* w = (const device uint8_t*)W + size_t(row0) * KB + lane * 8;
+    const device bfloat* sc = S + size_t(row0) * KG + lane / per_lane;
+    const device bfloat* bi = B + size_t(row0) * KG + lane / per_lane;
+    const int xl = int(lane) * 16;
+    for (int k0 = 0; k0 <= FULL; k0 += 512) {
+      if (k0 == FULL && !(FULL < K && int(lane) < (K - FULL) / 16)) break;
+      uint16_t codes[4][4];
+      float scale[4], bias[4];
+      for (int j = 0; j < 4; j++) {
+        const device uint16_t* ws = (const device uint16_t*)(w + j * KB);
+        for (int i = 0; i < 4; i++) codes[j][i] = ws[i];
+        scale[j] = float(sc[j * KG]);
+        bias[j] = float(bi[j * KG]);
+      }
+      for (int p = 0; p < GXMR; p += 2) {
+        if (p >= mr) break;
+        const int pb = min(p + 1, mr - 1); // an odd last row runs beside itself (its second result unused)
+        float xt[2][16];
+        float sum[2];
+        sum[0] = tf_rp_load16<4, false>(X + size_t(m0 + p) * K + xl + k0, xt[0]);
+        sum[1] = tf_rp_load16<4, false>(X + size_t(m0 + pb) * K + xl + k0, xt[1]);
+        for (int j = 0; j < 4; j++) {
+          float two[2] = {acc[p][j], acc[p + 1 < GXMR ? p + 1 : p][j]};
+          gx_qdot16_codes(codes[j], xt, scale[j], bias[j], sum, two);
+          acc[p][j] = two[0];
+          if (p + 1 < mr) acc[p + 1][j] = two[1];
+        }
+      }
+      w += 512 * 4 / 8; sc += 512 / GS; bi += 512 / GS;
+    }
+    for (int b = 0; b < GXMR; b++) {
+      if (b >= mr) break;
+      for (int j = 0; j < 4; j++) {
+        const float v = simd_sum(acc[b][j]);
+        if (lane == 0) OUT[size_t(m0 + b) * N + row0 + j] = bfloat(v);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// tf_rp_rows_at over K values of rows whose weights lie `KB` bytes (and scales KG groups) apart: a slice of K.
+template <int RPS, int MB, int BITS, bool BF16SUM>
+inline void tf_rp_rows_at_ld(const device uint8_t* w, const device bfloat* sc, const device bfloat* bi, thread const TfRpRows<MB>& x,
+                             int K, int KB, int KG, int GS, uint lane, thread float (*acc)[RPS]) {
+  typedef typename metal::conditional<(MB >= 3), bfloat, float>::type X;
+  const int FULL = K / 512 * 512;
+  const int per_lane = GS / 16;
+  w += lane * (16 * BITS / 8);
+  sc += lane / per_lane;
+  bi += lane / per_lane;
+  const int xl = int(lane) * 16;
+  float col[MB];
+  for (int j = 0; j < RPS; j++)
+    for (int b = 0; b < MB; b++) acc[b][j] = 0.0f;
+  for (int k0 = 0; k0 <= FULL; k0 += 512) {
+    if (k0 == FULL && !(FULL < K && int(lane) < (K - FULL) / 16)) break;
+    X xt[MB][16];
+    float sum[MB];
+    for (int b = 0; b < MB; b++) sum[b] = tf_rp_load16<BITS, BF16SUM>(x.x[b] + xl + k0, xt[b]);
+    for (int j = 0; j < RPS; j++) {
+      for (int b = 0; b < MB; b++) col[b] = acc[b][j];
+      tf_rp_qdot16<MB, BITS>(w + j * KB, xt, float(sc[j * KG]), float(bi[j * KG]), sum, col);
+      for (int b = 0; b < MB; b++) acc[b][j] = col[b];
+    }
+    w += 512 * BITS / 8; sc += 512 / GS; bi += 512 / GS;
+  }
+  for (int j = 0; j < RPS; j++)
+    for (int b = 0; b < MB; b++) acc[b][j] = simd_sum(acc[b][j]);
+}
+
+// Decode projections with K split four ways inside a threadgroup (tf-rewind's qmv_1 shape on the core's row math):
+// simdgroup s takes the s-th quarter of K for the threadgroup's 4 columns, two rows a pass (tf_rp_rows_at, MB 2 or
+// 1), and simdgroup 0 adds the quarters in order. Every window width runs the same arithmetic, so a row's sums do not
+// depend on its window (drafted output stays the undrafted one). K % 2048 == 0, 4-bit, groups of 64.
+// dims: K, N, GS, rows. Grid (N / 4), 128 threads.
+template <bool PAIRS>
+inline void gx_proj_k4_body(const device bfloat* X, const device uint32_t* W, const device bfloat* S, const device bfloat* B,
+                            constant int* dims, device bfloat* OUT, uint sg, uint lane, uint3 tg,
+                            threadgroup float (&part)[4][2][4]) {
+  const int K = dims[0], N = dims[1], GS = dims[2], rows = dims[3];
+  const int row0 = int(tg.x) * 4;
+  const int KQ = K / 4, KB = K * 4 / 8, KG = K / GS;
+  const device uint8_t* w = (const device uint8_t*)W + size_t(row0) * KB + size_t(sg) * (KQ * 4 / 8);
+  const device bfloat* sc = S + size_t(row0) * KG + size_t(sg) * (KQ / GS);
+  const device bfloat* bi = B + size_t(row0) * KG + size_t(sg) * (KQ / GS);
+  for (int m = 0; m < rows; m += PAIRS ? 2 : 1) {
+    const int mb = min(PAIRS ? 2 : 1, rows - m);
+    float acc[2][4];
+    if (mb == 2) {
+      TfRpRows<2> x;
+      x.x[0] = X + size_t(m) * K + size_t(sg) * KQ;
+      x.x[1] = X + size_t(m + 1) * K + size_t(sg) * KQ;
+      tf_rp_rows_at_ld<4, 2, 4, false>(w, sc, bi, x, KQ, KB, KG, GS, lane, acc);
+    } else {
+      TfRpRows<1> x;
+      x.x[0] = X + size_t(m) * K + size_t(sg) * KQ;
+      float one[1][4];
+      tf_rp_rows_at_ld<4, 1, 4, false>(w, sc, bi, x, KQ, KB, KG, GS, lane, one);
+      for (int j = 0; j < 4; j++) acc[0][j] = one[0][j];
+    }
+    if (lane == 0)
+      for (int b = 0; b < mb; b++)
+        for (int j = 0; j < 4; j++) part[sg][b][j] = acc[b][j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane < uint(mb * 4) && row0 + int(lane % 4) < N) {
+      const int b = int(lane) / 4, j = int(lane) % 4;
+      const float v = ((part[0][b][j] + part[1][b][j]) + part[2][b][j]) + part[3][b][j];
+      OUT[size_t(m + b) * N + row0 + j] = bfloat(v);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+// Two rows a pass over the K quarter (the pair kernel), or one row a pass (the slice read again from cache): the same sums.
+[[kernel]] void gx_proj_k4(const device bfloat* X [[buffer(0)]], const device uint32_t* W [[buffer(1)]],
+                           const device bfloat* S [[buffer(2)]], const device bfloat* B [[buffer(3)]],
+                           constant int* dims [[buffer(4)]], device bfloat* OUT [[buffer(5)]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                           uint3 tg [[threadgroup_position_in_grid]]) {
+  threadgroup float part[4][2][4];
+  gx_proj_k4_body<true>(X, W, S, B, dims, OUT, sg, lane, tg, part);
+}
+[[kernel]] void gx_proj_k4_1(const device bfloat* X [[buffer(0)]], const device uint32_t* W [[buffer(1)]],
+                             const device bfloat* S [[buffer(2)]], const device bfloat* B [[buffer(3)]],
+                             constant int* dims [[buffer(4)]], device bfloat* OUT [[buffer(5)]],
+                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                             uint3 tg [[threadgroup_position_in_grid]]) {
+  threadgroup float part[4][2][4];
+  gx_proj_k4_body<false>(X, W, S, B, dims, OUT, sg, lane, tg, part);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Decode projections, one simdgroup an output column (tf-rewind's qmv shape): a lane streams 16-byte loads of its
+// column's codes (32 a load, half a group of 64), and every row of the window is summed beside the others from the
+// same registers, two rows a pass. A row's sums take the same operations in the same order whatever the window's
+// width, so a drafted row equals the undrafted one bit for bit. 4-bit, groups of 64, K % 1024 == 0.
+// dims: K, N, GS, rows. Grid (N / 4), 128 threads.
+[[kernel]] void gx_proj_c1(const device bfloat* X [[buffer(0)]], const device uint32_t* W [[buffer(1)]],
+                           const device bfloat* S [[buffer(2)]], const device bfloat* B [[buffer(3)]],
+                           constant int* dims [[buffer(4)]], device bfloat* OUT [[buffer(5)]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                           uint3 tg [[threadgroup_position_in_grid]]) {
+  const int K = dims[0], N = dims[1], rows = dims[3];
+  const int col = int(tg.x) * 4 + int(sg);
+  if (col >= N) return;
+  const device uint4* wr = (const device uint4*)(W + size_t(col) * (K / 8));
+  const device bfloat* sr = S + size_t(col) * (K / 64);
+  const device bfloat* br = B + size_t(col) * (K / 64);
+  const int steps = K / 1024;
+  for (int m0 = 0; m0 < rows; m0 += 2) {
+    const int mb = min(2, rows - m0);
+    float acc[2] = {0.0f, 0.0f};
+    for (int i = 0; i < steps; i++) {
+      const int idx = int(lane) + 32 * i;
+      const uint4 w = wr[idx];
+      const float s = float(sr[idx / 2]), b = float(br[idx / 2]);
+      for (int r = 0; r < 2; r++) {
+        if (r >= mb) break;
+        const device bfloat4* xp = (const device bfloat4*)(X + size_t(m0 + r) * K + size_t(idx) * 32);
+        float dot = 0.0f, xs = 0.0f;
+        for (int c = 0; c < 4; c++) {
+          const uint word = w[c];
+          const float4 xa = float4(xp[2 * c]), xb = float4(xp[2 * c + 1]);
+          for (int j = 0; j < 4; j++) {
+            dot = fma(float((word >> (4 * j)) & 15u), xa[j], dot);
+            xs += xa[j];
+          }
+          for (int j = 0; j < 4; j++) {
+            dot = fma(float((word >> (4 * (j + 4))) & 15u), xb[j], dot);
+            xs += xb[j];
+          }
+        }
+        acc[r] = fma(s, dot, fma(b, xs, acc[r]));
+      }
+    }
+    for (int r = 0; r < mb; r++) {
+      const float v = simd_sum(acc[r]);
+      if (lane == 0) OUT[size_t(m0 + r) * N + col] = bfloat(v);
+    }
+  }
+}
+
+// gx_proj_c1 with the window's inputs staged in threadgroup memory a step at a time (1024 values a row, two rows),
+// shared by the threadgroup's 8 columns instead of read from cache by each: the same operations in the same order,
+// so the same bits as gx_proj_c1. dims: K, N, GS, rows. Grid (N / 8), 256 threads.
+[[kernel]] void gx_proj_c8(const device bfloat* X [[buffer(0)]], const device uint32_t* W [[buffer(1)]],
+                           const device bfloat* S [[buffer(2)]], const device bfloat* B [[buffer(3)]],
+                           constant int* dims [[buffer(4)]], device bfloat* OUT [[buffer(5)]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                           uint t [[thread_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
+  threadgroup bfloat4 xs4[2][256]; // two rows' 1024 inputs of this step
+  const int K = dims[0], N = dims[1], rows = dims[3];
+  const int col = int(tg.x) * 8 + int(sg);
+  const bool live = col < N;
+  const device uint4* wr = (const device uint4*)(W + size_t(min(col, N - 1)) * (K / 8));
+  const device bfloat* sr = S + size_t(min(col, N - 1)) * (K / 64);
+  const device bfloat* br = B + size_t(min(col, N - 1)) * (K / 64);
+  const int steps = K / 1024;
+  for (int m0 = 0; m0 < rows; m0 += 2) {
+    const int mb = min(2, rows - m0);
+    float acc[2] = {0.0f, 0.0f};
+    for (int i = 0; i < steps; i++) {
+      for (int r = 0; r < mb; r++)
+        xs4[r][t] = ((const device bfloat4*)(X + size_t(m0 + r) * K + size_t(i) * 1024))[t];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const int idx = int(lane) + 32 * i;
+      const uint4 w = wr[idx];
+      const float s = float(sr[idx / 2]), b = float(br[idx / 2]);
+      for (int r = 0; r < 2; r++) {
+        if (r >= mb) break;
+        float dot = 0.0f, xsum = 0.0f;
+        for (int c = 0; c < 4; c++) {
+          const uint word = w[c];
+          const float4 xa = float4(xs4[r][int(lane) * 8 + 2 * c]), xb = float4(xs4[r][int(lane) * 8 + 2 * c + 1]);
+          for (int j = 0; j < 4; j++) {
+            dot = fma(float((word >> (4 * j)) & 15u), xa[j], dot);
+            xsum += xa[j];
+          }
+          for (int j = 0; j < 4; j++) {
+            dot = fma(float((word >> (4 * (j + 4))) & 15u), xb[j], dot);
+            xsum += xb[j];
+          }
+        }
+        acc[r] = fma(s, dot, fma(b, xsum, acc[r]));
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int r = 0; r < mb; r++) {
+      const float v = simd_sum(acc[r]);
+      if (lane == 0 && live) OUT[size_t(m0 + r) * N + col] = bfloat(v);
+    }
+  }
+}

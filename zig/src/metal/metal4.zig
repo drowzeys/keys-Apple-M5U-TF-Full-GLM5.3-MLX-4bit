@@ -7,6 +7,15 @@ const Timeline = @import("metal4_timeline.zig").Timeline;
 
 const Id = objc.Id;
 const heap = std.heap.c_allocator;
+// glm_ax diagnostics (TF_METAL4_STATS=1): commit-path time, residency-set commits, commit-to-GPU-start lag
+extern "c" fn mach_absolute_time() u64;
+extern "c" fn mach_timebase_info(info: *[2]u32) c_int;
+pub var stats: struct { commits: u64 = 0, set_commits: u64 = 0, grew: u64 = 0, commit_s: f64 = 0, lag_s: f64 = 0, lagged: u64 = 0, run_s: f64 = 0 } = .{};
+fn hostSeconds() f64 {
+    var tb: [2]u32 = undefined;
+    _ = mach_timebase_info(&tb);
+    return @as(f64, @floatFromInt(mach_absolute_time())) * @as(f64, @floatFromInt(tb[0])) / @as(f64, @floatFromInt(tb[1])) / 1e9;
+}
 
 /// In only where the root declares `tf_metal4 = true` (the DeepSeek server) and in tests; elsewhere compiled out.
 pub const enabled = @import("builtin").is_test or (@hasDecl(@import("root"), "tf_metal4") and @import("root").tf_metal4);
@@ -72,6 +81,7 @@ pub const Slot = struct {
     start: [history]f64 = @splat(0),
     end: [history]f64 = @splat(0),
     bad: [history]bool = @splat(false),
+    sent: [history]f64 = @splat(0),
 
     /// A compute encoder on this slot's command buffer, after every earlier command of the queue.
     pub fn compute(s: *Slot, serial: bool) Id {
@@ -236,6 +246,9 @@ pub const Slot = struct {
         const i = n % history;
         s.start[i] = objc.msg(f64, fb, "GPUStartTime", .{});
         s.end[i] = objc.msg(f64, fb, "GPUEndTime", .{});
+        stats.lag_s += s.start[i] - s.sent[i];
+        stats.run_s += s.end[i] - s.start[i];
+        stats.lagged += 1;
         const err = objc.msg(?Id, fb, "error", .{});
         s.bad[i] = err != null;
         if (err) |e| s.q.fail(e);
@@ -406,6 +419,13 @@ pub const State = struct {
     }
 
     fn commit(q: *State, s: *Slot) void {
+        const c0 = hostSeconds();
+        defer {
+            stats.commits += 1;
+            stats.commit_s += hostSeconds() - c0;
+            if (stats.commits % 500 == 0 and std.c.getenv("TF_METAL4_STATS") != null)
+                std.log.info("metal 4 stats: {d} commits, residency-set commits {d} (grew {d}), commit call {d:.3} ms each, commit to GPU start {d:.3} ms each, GPU run {d:.3} ms each", .{ stats.commits, stats.set_commits, stats.grew, 1000 * stats.commit_s / @as(f64, @floatFromInt(stats.commits)), 1000 * stats.lag_s / @as(f64, @floatFromInt(@max(stats.lagged, 1))), 1000 * stats.run_s / @as(f64, @floatFromInt(@max(stats.lagged, 1))) });
+        }
         objc.msg(void, s.cb, "endCommandBuffer", .{});
         const options = objc.msg(Id, objc.msg(Id, objc.class("MTL4CommitOptions"), "alloc", .{}), "init", .{});
         defer objc.release(options);
@@ -413,6 +433,8 @@ pub const State = struct {
         q.lock();
         defer q.unlock();
         if (q.set_dirty) {
+            stats.set_commits += 1;
+            if (q.set_grew) stats.grew += 1;
             objc.msg(void, q.set, "commit", .{});
             if (q.set_grew) objc.msg(void, q.set, "requestResidency", .{});
             q.set_dirty = false;
@@ -420,6 +442,7 @@ pub const State = struct {
         }
         for (s.waits[0..s.nwaits]) |w| objc.msg(void, q.queue, "waitForEvent:value:", .{ w.id, w.value });
         const list = [1]Id{s.cb};
+        s.sent[s.commits % history] = hostSeconds();
         objc.msg(void, q.queue, "commit:count:options:", .{ @as([*]const Id, &list), @as(usize, 1), options });
         q.tick += 1;
         s.value = q.tick;
@@ -433,6 +456,16 @@ pub const State = struct {
     /// Blocks until the queue's event reaches `v`.
     fn reach(q: *State, v: u64) void {
         if (objc.msg(u64, q.event, "signaledValue", .{}) >= v) return;
+        // glm_ax: the event's own wait wakes a millisecond or more after the GPU signals; poll it every 20 us first
+        // (TF_METAL4_POLL_MS, default 200 ms of polling, then the blocking wait as before)
+        {
+            const poll_ms: u32 = if (std.c.getenv("TF_METAL4_POLL_MS")) |t| (std.fmt.parseInt(u32, std.mem.span(t), 10) catch 200) else 200;
+            var i: u64 = 0;
+            while (i < @as(u64, poll_ms) * 50) : (i += 1) {
+                if (objc.msg(u64, q.event, "signaledValue", .{}) >= v) return;
+                nap(20_000);
+            }
+        }
         var seconds: u32 = 0;
         while (!objc.msg(bool, q.event, "waitUntilSignaledValue:timeoutMS:", .{ v, @as(u64, 1000) })) {
             seconds += 1;

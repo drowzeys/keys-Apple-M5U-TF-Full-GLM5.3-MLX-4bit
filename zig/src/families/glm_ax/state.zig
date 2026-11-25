@@ -6,7 +6,7 @@ const cfg = @import("config.zig");
 /// Rows a decode forward takes at most: the router's launch limit; more take the prompt path (tensor-unit matmuls).
 pub const window_rows = 16;
 /// Rows a prompt chunk takes at most: each expert's weights are read once a chunk.
-pub const prompt_rows = 2048;
+pub const prompt_rows = 4096; // prompt chunks of 4096 rows: bigger expert groups (measured +6% at 4.9k-19.6k over 2048)
 /// Rows the indexer scores at once: its scores buffer is these rows by the context.
 pub const score_rows = 64;
 /// Rows the attention kernel takes a launch (its partial sums' buffer).
@@ -45,6 +45,8 @@ pub const Cache = struct {
     hidden: mtl.Buffer, // fp32 residual rows of the last window, before the final norm: the draft head's input
     held: [8]u32 = undefined, // the draft head's tokens for the next window
     nheld: usize = 0,
+    /// Each held draft's chance of landing as the head sees it: the running product of its max probabilities.
+    chance: [8]f64 = @splat(0),
     /// Drafted tokens this stream's windows verified, and how many were kept (the acceptance line at release).
     drafted: u64 = 0,
     accepted: u64 = 0,

@@ -14,6 +14,24 @@ const Own = @import("model.zig").Own;
 /// step5's glue kernels' constants (step5/glue.metal's s5_args).
 const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, dim: u32 = 0, span: u32 = 0, pos: u32 = 0, stride: u32 = 0, bits: u32 = 0, group: u32 = 0, eps: f32 = 0, theta: f32 = 0, limit: f32 = 0, ring: u32 = 0 };
 /// This family's kernels' constants (glm_ax.metal's gx_args).
+/// GLM_AX_SPLIT_ROWS, read at the first forward
+var split_rows: bool = false;
+/// GLM_AX_MM_FROM: decode windows of this many rows or more take the tensor-unit products (not the one-row
+/// kernel's bits: off by default).
+var mm_from: usize = 99;
+/// GLM_AX_MR_FROM: decode windows of this many rows or more take gx_rows_mr (off by default: the narrow row kernels
+/// measured faster at 3-6 rows, 59/73/102 vs 64/77/106 ms a step).
+var mr_from: usize = 99;
+/// GLM_AX_K4=1: decode projections with K split inside a threadgroup (gx_proj_k4).
+var k4: bool = false;
+/// GLM_AX_C1=1: decode projections a simdgroup an output column (gx_proj_c1).
+var c1: bool = false;
+/// GLM_AX_C8=1 (with GLM_AX_C1): the column kernel with the inputs staged in threadgroup memory (gx_proj_c8).
+var c8: bool = false;
+/// GLM_AX_K4_ROWS=1: gx_proj_k4 a row a pass (gx_proj_k4_1), the quarter read again from cache for the next row.
+var k4_rows: bool = false;
+var split_read: bool = false;
+
 pub const GArgs = extern struct { rows: u32 = 0, heads: u32 = 0, width: u32 = 0, stride: u32 = 0, score_stride: u32 = 0, in_stride: u32 = 0, pad0: u32 = 0, pad1: u32 = 0, eps: f32 = 0, scale: f32 = 0, key_scale: f32 = 0, head_scale: f32 = 0 };
 
 /// SwiGLU has no clamp in GLM-5.3: the shared kernel's limit past every bf16 value.
@@ -127,14 +145,71 @@ const Enc = struct {
 
     fn project(x: Enc, w: wts.Linear, in: mtl.Buffer, in_off: usize, out: mtl.Buffer, out_off: usize, n_rows: usize) !void {
         if (!x.on()) return;
-        if (n_rows > st.window_rows) {
-            // a prompt chunk: each group's row sums, then the tensor-unit product (each weight read once a chunk)
+        if (n_rows > st.window_rows or n_rows >= mm_from) {
+            // a prompt chunk, or a verify window of mm_from rows or more: each group's row sums, then the tensor-unit
+            // product (each weight read once for every row; the row kernels re-read it a pair of rows at a time)
             affine_mm.rowSums(x.e, x.m.mm, @intCast(w.group), bo(in, in_off), b(x.s.sums), @intCast(n_rows), @intCast(w.k));
             x.e.barrier();
             affine_mm.dense(x.e, x.m.mm, bo(in, in_off), b(x.s.sums), mat(w), bo(out, out_off), @intCast(n_rows));
             return;
         }
+        // GLM_AX_SPLIT_ROWS=1: a 2-4 row window as one-row launches side by side (the one-row kernel's occupancy)
+        if (n_rows > 1 and n_rows <= 4 and split_rows) {
+            const one = try rows.call(&x.m.rows, w, 1, false);
+            for (0..n_rows) |r| {
+                if (r > 0) {
+                    x.dispatches.* += 1;
+                }
+                x.e.setPipeline(one.pipeline);
+                x.e.setBuffer(in, in_off + r * w.k * 2, 0);
+                x.e.setBuffer(w.w, w.w_off, 1);
+                x.e.setBuffer(w.scales, w.s_off, 2);
+                x.e.setBuffer(w.biases, w.b_off, 3);
+                x.e.setValue(one.dims, 4);
+                x.e.setBuffer(out, out_off + r * w.n * 2, 5);
+                x.e.dispatchGroups(mtl.Size.of(one.groups, 1, 1), mtl.Size.of(one.threads, 1, 1));
+            }
+            return;
+        }
         const call = try rows.call(&x.m.rows, w, n_rows, false);
+        // GLM_AX_C1=1: every decode window through gx_proj_c1 (a simdgroup a column, one arithmetic for every width)
+        if (c1 and w.bits == 4 and w.group == 64 and w.k % 1024 == 0 and w.n % 4 == 0) {
+            x.e.setPipeline(x.m.moe_rows[if (c8) 8 else 7]);
+            x.e.setBuffer(in, in_off, 0);
+            x.e.setBuffer(w.w, w.w_off, 1);
+            x.e.setBuffer(w.scales, w.s_off, 2);
+            x.e.setBuffer(w.biases, w.b_off, 3);
+            x.e.setValue(call.dims, 4);
+            x.e.setBuffer(out, out_off, 5);
+            if (c8) x.e.dispatchGroups(mtl.Size.of((w.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1)) else x.e.dispatchGroups(mtl.Size.of(w.n / 4, 1, 1), mtl.Size.of(128, 1, 1));
+            return;
+        }
+        // GLM_AX_K4=1: every decode window through gx_proj_k4 (K split four ways a threadgroup, one arithmetic for
+        // every width)
+        if (k4 and w.bits == 4 and w.group == 64 and w.k % 2048 == 0 and w.n % 4 == 0) {
+            x.e.setPipeline(x.m.moe_rows[if (k4_rows) 6 else 5]);
+            x.e.setBuffer(in, in_off, 0);
+            x.e.setBuffer(w.w, w.w_off, 1);
+            x.e.setBuffer(w.scales, w.s_off, 2);
+            x.e.setBuffer(w.biases, w.b_off, 3);
+            x.e.setValue(call.dims, 4);
+            x.e.setBuffer(out, out_off, 5);
+            x.e.dispatchGroups(mtl.Size.of(w.n / 4, 1, 1), mtl.Size.of(128, 1, 1));
+            return;
+        }
+        // verify windows of mr_from rows or more: gx_rows_mr, every weight read once for up to 8 rows (the one-row
+        // kernel's bits); the core's row kernels read the weights again for every pair of rows
+        if (n_rows >= mr_from and w.bits == 4 and w.group == 64) {
+            x.e.setPipeline(x.m.moe_rows[4]);
+            x.e.setBuffer(in, in_off, 0);
+            x.e.setBuffer(w.w, w.w_off, 1);
+            x.e.setBuffer(w.scales, w.s_off, 2);
+            x.e.setBuffer(w.biases, w.b_off, 3);
+            x.e.setValue(call.dims, 4);
+            x.e.setBuffer(out, out_off, 5);
+            x.e.dispatchGroups(mtl.Size.of((w.n + 7) / 8, 1, 1), mtl.Size.of(64, 1, 1));
+            return;
+        }
         x.e.setPipeline(call.pipeline);
         x.e.setBuffer(in, in_off, 0);
         x.e.setBuffer(w.w, w.w_off, 1);
@@ -162,7 +237,7 @@ const Enc = struct {
     /// `batch` matrices [n, k] back to back in w, one a head: y[r, head] = x[r, head, :k] W_head^T on the tensor units.
     fn heads(x: Enc, w: wts.Linear, in: mtl.Buffer, in_stride: usize, out: mtl.Buffer, out_stride: usize, n_rows: usize, batch: usize) void {
         if (!x.on()) return;
-        if (n_rows <= st.window_rows) {
+        if (n_rows <= st.window_rows and n_rows < mm_from) {
             // decode rows: each head's weights read once for every row, one launch (gx_heads_gemv)
             x.e.setPipeline(x.m.kernel(.heads_gemv));
             x.e.setBuffer(in, 0, 0);
@@ -213,6 +288,8 @@ pub const Out = struct {
     /// `Pending.commit` (positions from `start`).
     pending: ?*Pending = null,
     start: ?usize = null,
+    /// A drafter's features: after each tapped layer, every row's residual (bf16) at row r's taps slot of `taps`.
+    taps: ?B = null,
 };
 
 /// A decode step encoded ahead: its command buffer (retained) and the ids buffer its embed reads.
@@ -258,6 +335,16 @@ fn rowTable(s: *st.Scratch, c: *const cfg.Config, start: usize, n: usize) void {
 
 /// `ids` at positions cache.len.. through the model: keys into the cache (len unmoved), logits out.
 pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, out: Out) !void {
+    if (!split_read) {
+        split_rows = std.c.getenv("GLM_AX_SPLIT_ROWS") != null;
+        if (std.c.getenv("GLM_AX_MM_FROM")) |v| mm_from = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 99;
+        k4 = std.c.getenv("GLM_AX_K4") != null;
+        c1 = std.c.getenv("GLM_AX_C1") != null;
+        c8 = std.c.getenv("GLM_AX_C8") != null;
+        k4_rows = std.c.getenv("GLM_AX_K4_ROWS") != null;
+        if (std.c.getenv("GLM_AX_MR_FROM")) |v| mr_from = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 99;
+        split_read = true;
+    }
     const c = &m.config;
     const n = ids.len;
     const start = out.start orelse cache.len;
@@ -267,6 +354,7 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     if (out.pending == null) @memcpy(s.ids.slice(u32, n), ids);
     rowTable(s, c, start, n);
     const h: usize = c.hidden;
+    run_start = nowNs();
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const cb = m.queue.commandBuffer();
@@ -275,7 +363,16 @@ pub fn run(m: *const Model, s: *st.Scratch, cache: *st.Cache, ids: []const u32, 
     var x = Enc{ .e = cb.compute(.concurrent), .cb = cb, .m = m, .s = s, .prof = out.profile, .only = out.only, .dispatches = out.dispatches orelse &count, .join = &join };
     const W = m.weights;
     embed(x, n);
-    for (W.layers[0..W.main], 0..) |l, i| try layer(&x, cache, l, i, start, n, i > 0, if (i + 1 < W.main) W.layers[i + 1].input_norm else null);
+    for (W.layers[0..W.main], 0..) |l, i| {
+        try layer(&x, cache, l, i, start, n, i > 0, if (i + 1 < W.main) W.layers[i + 1].input_norm else null);
+        if (out.taps) |tb| if (m.tap_at[i] >= 0 and x.on()) {
+            x.e.setPipeline(m.df[@intFromEnum(@import("dflash2.zig").Kernel.tap)]);
+            x.e.setBuffer(s.resid, 0, 0);
+            x.e.setValue([4]u32{ @intCast(n), c.hidden, m.taps, @intCast(m.tap_at[i]) }, 1);
+            x.e.setBuffer(tb.buf, tb.off, 2);
+            x.e.dispatchThreads(mtl.Size.of(c.hidden, n, 1), mtl.Size.of(256, 1, 1));
+        };
+    }
     try x.mark(.head);
     // the rows after the final norm: the head's input, and the draft head's (kept in `hidden` when asked for)
     const normed = out.hidden orelse b(s.hid);
@@ -312,6 +409,7 @@ pub fn mtp(m: *const Model, s: *st.Scratch, cache: *st.Cache, hidden: B, tokens:
     const nr: u32 = @intCast(n);
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
+    run_start = nowNs();
     const cb = m.queue.commandBuffer();
     var count: usize = 0;
     var join = false;
@@ -336,11 +434,33 @@ fn embed(x: Enc, n: usize) void {
     x.glue(.embed, args, &.{ b(x.s.ids), bo(E.w, E.w_off), bo(E.scales, E.s_off), bo(E.biases, E.b_off), A, b(x.s.resid) }, .{ c.hidden, n, 1 }, .{ 256, 1, 1 }, false);
 }
 
+/// Where finish's wall time goes (ns, summed since the last read): encoding before the commit, the wait for the
+/// GPU, the GPU times' read and the failure check (Metal 4 waits for the commit's feedback in the last two).
+pub var split: struct { runs: u64 = 0, encode: u64 = 0, wait: u64 = 0, times: u64 = 0, failure: u64 = 0 } = .{};
+pub var run_start: i128 = 0;
+
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+
 fn finish(x: Enc) !void {
     x.e.end();
+    const t0 = nowNs();
     x.cb.commit();
     x.cb.wait();
+    const t1 = nowNs();
     x.s.last_gpu = x.cb.gpuSeconds();
+    const t2 = nowNs();
+    defer {
+        const t3 = nowNs();
+        split.runs += 1;
+        if (run_start != 0) split.encode += @intCast(@max(0, t0 - run_start));
+        split.wait += @intCast(t1 - t0);
+        split.times += @intCast(t2 - t1);
+        split.failure += @intCast(t3 - t2);
+    }
     if (x.cb.failure()) |msg| {
         std.log.err("glm_ax forward: {s}", .{msg});
         return error.GpuFailed;
@@ -390,13 +510,15 @@ fn layer(x: *Enc, cache: *st.Cache, l: wts.Layer, i: usize, start: usize, n: usi
             const fused = n <= st.window_rows and std.c.getenv("GLM_AX_MOE_FUSED") != null;
             // decode with no stage filter: the shared expert's three launches run beside the routed path's
             const interleave = n <= st.window_rows and x.only == null and !fused;
+            // GLM_AX_SKIP_SHARED=1 (timing only, wrong output): no shared expert, its marginal cost in a whole step
+            const skip_shared = std.c.getenv("GLM_AX_SKIP_SHARED") != null;
             var r0: usize = 0;
             while (n <= st.window_rows and r0 < n and x.on()) : (r0 += st.window_rows) { // decode: 16-row launches
                 x.dispatches.* += 1;
                 const blk: u32 = @intCast(@min(st.window_rows, n - r0));
                 const at = r0 * c.topk * 4;
                 route.logits(x.e, m.route[0], .{ .hidden = c.hidden, .experts = c.experts, .topk = c.topk }, bo(s.x, r0 * h * 2), b(e.router), b(s.logits32), blk);
-                if (interleave) {
+                if (interleave and !skip_shared) {
                     // the shared expert's gate/up beside the router's logits (both read s.x only)
                     x.beside();
                     try x.project(e.shared.gate_up, s.x, 0, s.gate, 0, n);
@@ -413,7 +535,7 @@ fn layer(x: *Enc, cache: *st.Cache, l: wts.Layer, i: usize, start: usize, n: usi
                     .counts = b(s.route[5]),
                     .word = b(s.route[6]),
                 });
-                if (interleave) {
+                if (interleave and !skip_shared) {
                     // its SwiGLU beside the select (the barrier before the select saw gate/up done)
                     x.beside();
                     x.own(.swiglu, .{ .rows = @intCast(n), .width = c.moe_inter }, &.{ b(s.gate), A, b(s.act) }, .{ c.moe_inter, n, 1 }, .{ 256, 1, 1 }, false);
@@ -477,7 +599,7 @@ fn layer(x: *Enc, cache: *st.Cache, l: wts.Layer, i: usize, start: usize, n: usi
                 try x.experts(gate, s.x, s.eg, s.pick, slots);
                 x.beside();
                 try x.experts(up, s.x, s.eu, s.pick, slots);
-                if (interleave) {
+                if (interleave and !skip_shared) {
                     // the shared expert's down beside the routed gate and up
                     x.beside();
                     try x.project(e.shared.down, s.act, 0, s.shared, 0, n);
@@ -580,7 +702,7 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
     try x.mark(.absorb);
     const qw: usize = c.kv_lora + c.rope; // a head's query row: its latent query, then its roped 64
     // decode rows: embed_q and the rope in one launch (gx_absorb), unless GLM_AX_UNFUSED
-    const fuse = n <= st.window_rows and std.c.getenv("GLM_AX_UNFUSED") == null;
+    const fuse = n <= st.window_rows and n < mm_from and std.c.getenv("GLM_AX_UNFUSED") == null;
     const fuse_unembed = fuse and std.c.getenv("GLM_AX_FUSE_UNEMBED") != null;
     if (fuse) {
         const we = w.embed_q;
@@ -603,8 +725,19 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
     }
     try x.mark(.attend);
     if (n > st.window_rows) {
-        // a prompt chunk: each row's listed keys on the tensor units, 16 heads a threadgroup (glm_ax_sparse.metal)
-        if (x.on()) {
+        // a prompt chunk: each row's listed keys on the tensor units, 16 heads a threadgroup (glm_ax_sparse.metal);
+        // by default 32 heads a threadgroup by cooperative tensors (glm_ax_mpp.metal; GLM_AX_NO_MPP=1 for the former)
+        if (m.sparse_mpp) |mp| if (x.on()) {
+            x.e.setPipeline(mp);
+            x.e.setBuffer(s.qlat, 0, 0);
+            x.e.setBuffer(keys.buf, keys.off, 1);
+            x.e.setBuffer(s.keys, 0, 2);
+            x.e.setValue(ga.scale, 3);
+            x.e.setValue([4]i32{ @intCast(c.i_topk), @intCast(start + n), @intCast(start), 0 }, 4);
+            x.e.setBuffer(s.olat, 0, 5);
+            x.e.dispatchGroups(mtl.Size.of(nh / 32, n, 1), mtl.Size.of(256, 1, 1));
+        };
+        if (m.sparse_mpp == null) if (x.on()) {
             x.e.setPipeline(m.sparse_nax);
             x.e.setBuffer(s.qlat, 0, 0);
             x.e.setBuffer(keys.buf, keys.off, 1);
@@ -613,7 +746,7 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
             x.e.setValue([4]i32{ @intCast(c.i_topk), @intCast(start + n), @intCast(start), 0 }, 4);
             x.e.setBuffer(s.olat, 0, 5);
             x.e.dispatchGroups(mtl.Size.of(nh / 16, n, 1), mtl.Size.of(128, 1, 1));
-        }
+        };
     } else if (std.c.getenv("GLM_AX_OLD_ATTN") == null) {
         // decode rows: each row's key list in attn_blocks blocks on the tensor units, then the blocks merged
         const width: usize = @min(c.i_topk, start + n); // the longest list a row of the window has

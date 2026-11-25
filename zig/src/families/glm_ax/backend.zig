@@ -39,6 +39,24 @@ fn depthCap() usize {
     return @max(1, @min(n, max_drafts));
 }
 
+/// GLM_AX_MTP_FLOOR (0-1): the lane engine verifies a held draft past the first only while the head's running
+/// chance (the product of its drafts' max probabilities) stays at or above it, and the head stops drafting there
+/// (no second MTP pass for a draft that would not be verified); null when unset (every requested draft runs).
+fn mtpFloor() ?f64 {
+    const v = std.c.getenv("GLM_AX_MTP_FLOOR") orelse return null;
+    const f = std.fmt.parseFloat(f64, std.mem.span(v)) catch return null;
+    return if (f >= 0 and f <= 1) f else null;
+}
+
+/// The probability of the max of bf16 logits `l` (softmax at T = 1).
+fn topProbability(l: []const u16) f64 {
+    var most: f32 = -std.math.inf(f32);
+    for (l) |w| most = @max(most, logit(w));
+    var sum: f64 = 0;
+    for (l) |w| sum += @exp(@as(f64, logit(w) - most));
+    return 1.0 / sum;
+}
+
 /// The prompt cache's room beside the streams: its kept states fit in `bytes`, never evicting `restoring`.
 pub const Room = struct { ctx: *anyopaque, fit: *const fn (ctx: *anyopaque, bytes: u64, restoring: ?*anyopaque, prompt: []const u32) void };
 
@@ -54,6 +72,9 @@ pub const Metal = struct {
     room: ?Room = null, // the prompt cache, which takes what the streams leave of the budget
     ahead: fwd.Pending = .{}, // the next decode row of `ahead_stream`, encoded while the GPU ran the last one
     ahead_stream: ?*lanes.Stream = null,
+    /// A drafter's features: each stream's tapped rows at every position (prepare_features turns them on).
+    tapping: bool = false,
+    taps: std.AutoHashMapUnmanaged(*st.Cache, mtl.Buffer) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
@@ -72,6 +93,9 @@ pub const Metal = struct {
             self.gpa.destroy(cache.*);
         }
         self.caches.deinit(self.gpa);
+        var ti = self.taps.valueIterator();
+        while (ti.next()) |x| x.deinit();
+        self.taps.deinit(self.gpa);
         self.scratch.deinit();
         self.prompt.deinit();
         self.gpa.destroy(self);
@@ -102,11 +126,11 @@ pub const Metal = struct {
     pub fn facts(self: *const Metal) lanes.Model {
         // rows are independent in every kernel of a decode window, so any width to 16 gives one-row steps' bits
         const mtp = self.model.config.mtp > 0;
-        return .{ .exact_width = st.window_rows, .mtp = mtp, .speculate = mtp, .speculate_early = false, .drafts = if (mtp) @intCast(depthCap()) else 1, .max_streams = self.options.streams, .streams_exact = true };
+        return .{ .exact_width = st.window_rows, .mtp = mtp, .speculate = mtp, .speculate_early = false, .drafts = if (mtp) @intCast(depthCap()) else 1, .max_streams = self.options.streams, .streams_exact = true, .draft_confidence = if (mtp) mtpFloor() else null, .draft_probabilities = mtp and mtpFloor() != null };
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .held = heldFn } };
+        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .held = heldFn, .prepare_features = prepareFn, .features = featuresFn, .probabilities = probabilitiesFn } };
     }
 
     fn cast(ptr: *anyopaque) *Metal {
@@ -115,6 +139,61 @@ pub const Metal = struct {
 
     fn cacheOf(self: *Metal, stream: *lanes.Stream) !*st.Cache {
         return self.caches.get(stream) orelse error.UnknownGlmStream;
+    }
+
+    /// A tapped row's bytes: every tap's hidden row, bf16.
+    pub fn tapBytes(self: *const Metal) usize {
+        return @as(usize, self.model.taps) * self.model.config.hidden * 2;
+    }
+
+    /// The tapped rows' place for a pass starting at `start` (null: no drafter, or the cache has none).
+    fn tapsAt(self: *Metal, cache: *st.Cache, start: usize) ?fwd.B {
+        if (!self.tapping) return null;
+        const x = self.taps.get(cache) orelse return null;
+        return .{ .buf = x, .off = start * self.tapBytes() };
+    }
+
+    /// The drafter's layers: every stream's passes keep their tapped rows from now on.
+    fn prepareFn(ptr: *anyopaque, taps: []const u32) !void {
+        const self = cast(ptr);
+        try self.model.setTaps(taps);
+        self.tapping = true;
+    }
+
+    /// Rows [start, start + count) of the stream's tapped rows, on the device.
+    fn featuresFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, start: u64, count: u32) !be.Features {
+        const self = cast(ptr);
+        const cache = try self.cacheOf(stream);
+        if (taps.len != self.model.taps or !self.tapping) return error.UnpreparedGlmTaps;
+        const x = self.taps.get(cache) orelse return error.UnpreparedGlmTaps;
+        if (count == 0 or start + count > cache.len) return error.GlmTapsNotHeld;
+        const width = self.tapBytes();
+        return .{ .buffer = @intFromPtr(x.id), .offset = start * width, .rows = count, .row_bytes = @intCast(width), .space = .device, .dtype = .bf16 };
+    }
+
+    /// Each decode window's forward ms by rows (1..16) on a scratch cache, for a drafter's depth rule.
+    pub fn measureWindows(self: *Metal) !void {
+        const c = &self.model.config;
+        var cache = try st.Cache.init(self.model.device, c, 1024 + 2 * st.window_rows + 2);
+        defer cache.deinit();
+        var ids: [1024]u32 = undefined;
+        for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i * 37 % 20000);
+        try self.feed(&cache, &ids, null);
+        var win: [st.window_rows]u32 = undefined;
+        for (&win, 0..) |*x, i| x.* = @intCast(2000 + i * 53 % 20000);
+        for (1..st.window_rows + 1) |w| {
+            var best: f64 = 1e9;
+            for (0..2) |_| {
+                try fwd.run(self.model, &self.scratch, &cache, win[0..w], .{ .all = true, .hidden = .{ .buf = cache.hidden } });
+                best = @min(best, self.scratch.last_gpu);
+            }
+            self.model.window_costs[w - 1] = .{ .width = @intCast(w), .ms = 1000.0 * best };
+        }
+        self.model.window_costs_n = st.window_rows;
+        var line: [512]u8 = undefined;
+        var at: usize = 0;
+        for (self.model.window_costs[0..st.window_rows]) |x| at += (std.fmt.bufPrint(line[at..], " {d}:{d:.1}", .{ x.width, x.ms }) catch break).len;
+        std.log.info("glm_ax: decode windows' ms by rows:{s}", .{line[0..at]});
     }
 
     fn logits(self: *Metal, cache: *st.Cache) []const u16 {
@@ -142,7 +221,7 @@ pub const Metal = struct {
             const trace = std.c.getenv("GLM_AX_TRACE") != null;
             var t0: std.c.timespec = undefined;
             if (trace) _ = std.c.clock_gettime(.MONOTONIC, &t0);
-            try fwd.run(self.model, s, cache, ids[at..end], .{ .hidden = .{ .buf = s.hid } });
+            try fwd.run(self.model, s, cache, ids[at..end], .{ .hidden = .{ .buf = s.hid }, .taps = self.tapsAt(cache, cache.len) });
             if (trace) {
                 var t1: std.c.timespec = undefined;
                 _ = std.c.clock_gettime(.MONOTONIC, &t1);
@@ -187,6 +266,12 @@ pub const Metal = struct {
         errdefer cache.deinit();
         try self.caches.put(self.gpa, stream, cache); // a mark's save finds it there
         errdefer _ = self.caches.remove(stream);
+        if (self.tapping) {
+            const tb = try self.model.device.buffer(capacity * self.tapBytes(), mtl.ResourceOptions.shared);
+            errdefer tb.deinit();
+            try self.taps.put(self.gpa, cache, tb);
+        }
+        errdefer if (self.taps.fetchRemove(cache)) |e| e.value.deinit();
         stream.cached = 0;
         if (stream.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
             const snap: *const snapshot.Snap = @ptrCast(@alignCast(saved));
@@ -238,13 +323,13 @@ pub const Metal = struct {
             self.ahead = .{};
         } else {
             self.dropAhead();
-            try fwd.run(self.model, &self.scratch, cache, &.{token}, .{ .hidden = .{ .buf = cache.hidden }, .pending = &cur });
+            try fwd.run(self.model, &self.scratch, cache, &.{token}, .{ .hidden = .{ .buf = cache.hidden }, .pending = &cur, .taps = self.tapsAt(cache, cache.len) });
         }
         cur.commit(&.{token});
         // the next row encoded while the GPU runs this one: its own ids and rows table, committed by the next call
         if (cache.len + 2 <= cache.capacity and std.c.getenv("GLM_AX_NO_AHEAD") == null) {
             self.scratch.flip();
-            fwd.run(self.model, &self.scratch, cache, &.{0}, .{ .hidden = .{ .buf = cache.hidden }, .pending = &self.ahead, .start = cache.len + 1 }) catch self.dropAhead();
+            fwd.run(self.model, &self.scratch, cache, &.{0}, .{ .hidden = .{ .buf = cache.hidden }, .pending = &self.ahead, .start = cache.len + 1, .taps = self.tapsAt(cache, cache.len + 1) }) catch self.dropAhead();
             self.ahead_stream = stream;
         }
         try cur.wait();
@@ -268,12 +353,12 @@ pub const Metal = struct {
             self.ahead = .{};
         } else {
             self.dropAhead();
-            try fwd.run(self.model, &self.scratch, cache, &.{w.pending}, .{ .all = true, .hidden = .{ .buf = cache.hidden }, .pending = &cur });
+            try fwd.run(self.model, &self.scratch, cache, &.{w.pending}, .{ .all = true, .hidden = .{ .buf = cache.hidden }, .pending = &cur, .taps = self.tapsAt(cache, cache.len) });
         }
         cur.commit(&.{w.pending});
         if (cache.len + 2 <= cache.capacity and std.c.getenv("GLM_AX_NO_AHEAD") == null) {
             self.scratch.flip();
-            fwd.run(self.model, &self.scratch, cache, &.{0}, .{ .all = true, .hidden = .{ .buf = cache.hidden }, .pending = &self.ahead, .start = cache.len + 1 }) catch self.dropAhead();
+            fwd.run(self.model, &self.scratch, cache, &.{0}, .{ .all = true, .hidden = .{ .buf = cache.hidden }, .pending = &self.ahead, .start = cache.len + 1, .taps = self.tapsAt(cache, cache.len + 1) }) catch self.dropAhead();
             self.ahead_stream = w.stream;
         }
         try cur.wait();
@@ -329,7 +414,7 @@ pub const Metal = struct {
             @memcpy(ids[1..][0..w.held], cache.held[0..w.held]);
             @memcpy(ids[1 + w.held ..][0..w.tokens.len], w.tokens);
             const t_start = profStart(cache);
-            try fwd.run(self.model, &self.scratch, cache, ids[0..rows], .{ .all = true, .hidden = .{ .buf = cache.hidden } });
+            try fwd.run(self.model, &self.scratch, cache, ids[0..rows], .{ .all = true, .hidden = .{ .buf = cache.hidden }, .taps = self.tapsAt(cache, cache.len) });
             cache.prof.verify += 1;
             cache.prof.verify_gpu += self.scratch.last_gpu;
             defer {
@@ -416,17 +501,35 @@ pub const Metal = struct {
             const depth = @min(r.depth, depthCap());
             var pos = first + kept - 1;
             var k: usize = 0;
+            const floor = mtpFloor();
+            var run: f64 = 1;
             while (k < depth) : (k += 1) {
-                const d: u32 = @intCast(argmax(s.logits_all.slice(u16, c.vocab)));
+                const l = s.logits_all.slice(u16, c.vocab);
+                const d: u32 = @intCast(argmax(l));
                 cache.held[k] = d;
                 cache.nheld = k + 1;
+                if (floor != null) {
+                    run *= topProbability(l);
+                    cache.chance[k] = run;
+                }
                 if (k + 1 == depth) break;
+                // a draft past the first is verified only at a running chance of the floor or more: stop drafting
+                if (floor) |f| if (run < f) break;
                 pos += 1;
                 @memcpy(s.chain.contents()[0 .. c.hidden * 2], (s.hid.contents() + (if (k == 0) kept - 1 else 0) * c.hidden * 2)[0 .. c.hidden * 2]);
                 try fwd.mtp(self.model, s, cache, .{ .buf = s.chain }, &.{d}, pos);
                 cache.prof.draft_gpu += s.last_gpu;
             }
         }
+    }
+
+    /// Each held draft's running chance (GLM_AX_MTP_FLOOR); drafts the head did not run have none.
+    fn probabilitiesFn(ptr: *anyopaque, stream: *lanes.Stream, out: []f64) !bool {
+        const cache = try cast(ptr).cacheOf(stream);
+        if (mtpFloor() == null) return false;
+        for (out, 0..) |*o, i| o.* = if (i < cache.nheld) cache.chance[i] else 0;
+        if (cache.nheld < out.len) stream.draft_chances_cut = cache.nheld;
+        return true;
     }
 
     /// The held drafts in window order, for a grammar to walk.
@@ -445,6 +548,12 @@ pub const Metal = struct {
             if (cc.drafted > 0) std.log.info("glm_ax: by position: 1st {d}/{d}, 2nd {d}/{d}, 3rd {d}/{d}", .{ cc.accepted_at[0], cc.drafted_at[0], cc.accepted_at[1], cc.drafted_at[1], cc.accepted_at[2], cc.drafted_at[2] });
             const p = cc.prof;
             if (p.verify > 0) std.log.info("glm_ax: rounds: {d} verify passes {d:.2} ms wall / {d:.2} ms GPU each, {d} draft passes {d:.2} ms wall / {d:.2} ms GPU each, {d:.2} ms a pass between calls", .{ p.verify, 1000 * p.verify_wall / @as(f64, @floatFromInt(p.verify)), 1000 * p.verify_gpu / @as(f64, @floatFromInt(p.verify)), p.draft, if (p.draft > 0) 1000 * p.draft_wall / @as(f64, @floatFromInt(p.draft)) else 0, if (p.draft > 0) 1000 * p.draft_gpu / @as(f64, @floatFromInt(p.draft)) else 0, 1000 * p.gap / @as(f64, @floatFromInt(p.verify)) });
+            if (self.taps.fetchRemove(cc)) |e| e.value.deinit();
+            {
+                const sp = fwd.split;
+                if (sp.runs > 0) std.log.info("glm_ax: finish split over {d} passes, ms each: encode {d:.2}, commit+wait {d:.2}, GPU times read {d:.2}, failure check {d:.2}", .{ sp.runs, @as(f64, @floatFromInt(sp.encode)) / 1e6 / @as(f64, @floatFromInt(sp.runs)), @as(f64, @floatFromInt(sp.wait)) / 1e6 / @as(f64, @floatFromInt(sp.runs)), @as(f64, @floatFromInt(sp.times)) / 1e6 / @as(f64, @floatFromInt(sp.runs)), @as(f64, @floatFromInt(sp.failure)) / 1e6 / @as(f64, @floatFromInt(sp.runs)) });
+                fwd.split = .{};
+            }
             self.held -= st.cacheBytes(&self.model.config, entry.value.capacity);
             entry.value.deinit();
             self.gpa.destroy(entry.value);

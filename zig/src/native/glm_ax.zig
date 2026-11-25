@@ -18,6 +18,11 @@ const Host = struct {
     config: lanes.Config,
     clock: lanes.backend.WallClock,
     core: lanes.Engine,
+    /// GLM_AX_DFLASH2=<dir>: incoai's DFlash2 drafter, and the lane engine's wrapper that drafts with it.
+    drafter: ?*s5.dflash2.Drafter = null,
+    /// GLM_AX_DSPARK=<dir>: RedHat's DSpark drafter instead (its confidence head's chances: GLM_AX_DSPARK_FLOOR).
+    dspark: ?*s5.dspark.Drafter = null,
+    wrap: ?lanes.drafted.Drafted = null,
     host: api.LaneHost,
     cache: ?api.prompt_cache.Store = null, // kept prompt states, in what the streams' caches leave of the budget
     cache_cap: u64 = 0, // --prompt-cache-gib's bytes (the budget when unset)
@@ -27,6 +32,9 @@ const Host = struct {
         h.host.stop();
         if (h.cache) |*store| store.deinit();
         h.core.deinit();
+        if (h.wrap) |*w| w.deinit();
+        if (h.drafter) |d| d.deinit();
+        if (h.dspark) |d| d.deinit();
         h.config.deinit(h.gpa);
         s5.residency.drop(h);
         h.metal.deinit();
@@ -77,10 +85,39 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.metal = try s5.backend.Metal.init(gpa, model, .{ .capacity = want, .streams = @max(o.lanes, 1), .budget = budget });
     errdefer h.metal.deinit();
     try h.metal.warm();
-    h.config = try lanes.Config.init(gpa, h.metal.facts(), s5.state.window_rows, s5.state.window_rows - 1);
+    h.drafter = null;
+    h.wrap = null;
+    if (std.c.getenv("GLM_AX_DFLASH2")) |dir| if (o.drafts) {
+        try h.metal.measureWindows();
+        h.drafter = s5.dflash2.Drafter.init(gpa, io, model, std.mem.span(dir)) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "GLM_AX_DFLASH2={s}: the DFlash2 drafter cannot load ({s})", .{ std.mem.span(dir), @errorName(err) });
+            h.metal.deinit();
+            gpa.destroy(h);
+            model.deinit();
+            return null;
+        };
+        h.wrap = try lanes.drafted.Drafted.init(gpa, h.metal.backend(), h.drafter.?.drafter());
+    };
+    h.dspark = null;
+    if (h.wrap == null) if (std.c.getenv("GLM_AX_DSPARK")) |dir| if (o.drafts) {
+        try h.metal.measureWindows();
+        h.dspark = s5.dspark.Drafter.init(gpa, io, model, std.mem.span(dir)) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "GLM_AX_DSPARK={s}: the DSpark drafter cannot load ({s})", .{ std.mem.span(dir), @errorName(err) });
+            h.metal.deinit();
+            gpa.destroy(h);
+            model.deinit();
+            return null;
+        };
+        h.wrap = try lanes.drafted.Drafted.init(gpa, h.metal.backend(), h.dspark.?.drafter());
+    };
+    errdefer if (h.wrap) |*w| w.deinit();
+    errdefer if (h.drafter) |d| d.deinit();
+    errdefer if (h.dspark) |d| d.deinit();
+    const target_facts = h.metal.facts();
+    h.config = try lanes.Config.init(gpa, if (h.wrap) |*w| w.facts(target_facts) else target_facts, s5.state.window_rows, s5.state.window_rows - 1);
     errdefer h.config.deinit(gpa);
     h.clock = .{ .io = io };
-    h.core = lanes.Engine.init(gpa, &h.config, h.metal.backend(), h.clock.clock());
+    h.core = lanes.Engine.init(gpa, &h.config, if (h.wrap) |*w| w.backend() else h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = s5.state.prompt_rows, .decode_share = o.decode_share, .structures = true, .logprobs = true });
     h.cache = null;
@@ -97,7 +134,8 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     errdefer if (h.cache) |*store| store.deinit();
     try s5.residency.hold(h);
     errdefer s5.residency.drop(h);
-    h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
+    // GLM_AX_NO_KEEPALIVE=1: no idle keepalive ticker (its probes are command buffers of their own on the GPU)
+    if (std.c.getenv("GLM_AX_NO_KEEPALIVE") == null) h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

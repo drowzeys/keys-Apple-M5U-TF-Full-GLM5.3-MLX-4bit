@@ -1,14 +1,31 @@
 keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit
 Modified copy of TensorFold (https://github.com/ashhart/TensorFold) at upstream
-commit d30325dcb5422d3981ab6de6633e2ae0af6ad17e (version 1.3.4).
+tag v1.3.5 (commit 02b324ae9767253d9911d753d5c835a5070eed1b). Releases up to
+v0.1.0 of this repository were based on upstream commit d30325dc (1.3.4).
 
 Changes made by this repository's author (drowzeys), 2026, are listed in
 MODIFICATIONS.md. In short: a new model family `glm_ax` (full GLM-5.3 on MLX
-4-bit weights, Metal), its registration in four upstream files, one dispatch-size
-fix in the GLM DSA indexer, upstream's README moved to README-TensorFold.md,
-benchmark scripts and an MTP-head merge script under glm53/. The glm_ax Metal kernels were derived from TensorFold's own GLM-5.3-Flash
+4-bit weights, Metal, with MTP, DFlash2 and DSpark drafting), its registration in
+four upstream files, one dispatch-size fix in the GLM DSA indexer, opt-in
+diagnostics and event polling in the Metal 4 queue, upstream's README moved to
+README-TensorFold.md, benchmark scripts and an MTP-head merge script under glm53/.
+
+The glm_ax Metal kernels were derived from TensorFold's own GLM-5.3-Flash
 kernels (glm_sparse_nax, glm_index_nax and their split/combine decode path) and
 build on TensorFold's core row-projection, affine matmul and MoE routing code.
+The drafter ports reuse TensorFold's MiniMax-M3 DFlash2/DSpark kernels.
+
+zig/kernels/metal/glm_ax/glm_ax_mpp.metal (prompt attention) contains code adapted
+from Splash (https://github.com/incoai/splash, commit d23cfa1f, Apache-2.0),
+runtime/metal/kernels/shared/listed_attention.metal (attention_bf16_listed_kv1_g64),
+which ports the method of oMLX 0.8.0rc1's tensor-unit sparse MLA attention
+(https://github.com/jundot/omlx, omlx/patches/glm_moe_dsa/sparse_mla_nax.py,
+Apache-2.0). It was changed to read glm_ax's cache rows in place through each row's
+key list; its header names both sources.
+The DSpark drafter code (glm_ax/dspark.zig) was written from the semantics of
+RedHat AI's speculators (DSparkDraftModel) and vLLM's qwen3_dspark / dspark
+speculator code (both Apache-2.0), read only, not copied; the DFlash2 drafter
+(glm_ax/dflash2.zig) follows SGLang's DFlash2DraftModel (Apache-2.0) the same way.
 These changes are released under the same Apache License, Version 2.0.
 
 -------------------------------------------------------------------------------

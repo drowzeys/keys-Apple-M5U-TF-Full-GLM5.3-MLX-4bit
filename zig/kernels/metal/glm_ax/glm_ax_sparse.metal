@@ -176,7 +176,9 @@ inline void sparse_pass(thread frag<float> (&acc)[4][2], thread float (&m)[2], t
         }
         mma_16x32<false, false>(acc[c][0], acc[c][1], p1[kb], v0, v1);
         mma_16x32<false, false>(acc[c][0], acc[c][1], p2[kb], v0, v1);
+#ifndef GX_P2
         mma_16x32<false, false>(acc[c][0], acc[c][1], p3[kb], v0, v1);
+#endif
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

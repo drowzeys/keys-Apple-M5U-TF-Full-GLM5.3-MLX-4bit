@@ -10,7 +10,7 @@ pub fn hold(h: anytype) !void {
     // new prompt after an idle gap took 16.0 s against 8.4 s without it (4.9k tokens)
     if (std.c.getenv("GLM_AX_RESIDENCY") == null or std.c.getenv("GLM_AX_NO_RESIDENCY") != null) {
         h.resident = null;
-        h.warm = .{ .queue = h.model.queue };
+        h.warm = .{ .queue = h.model.tickQueue() };
         return;
     }
     var list: std.ArrayList(mtl.Buffer) = .empty;
@@ -22,12 +22,12 @@ pub fn hold(h: anytype) !void {
     try mtl.resident.fields.append(h.gpa, &list, &h.metal.prompt);
     h.resident = try Resident.holdUnder(h.gpa, h.io, m.device, m.queue, list.items, "glm_ax", h.limit);
     if (h.resident) |*r| h.metal.setResident(r.follow());
-    h.warm = if (h.resident) |*r| r.target() else .{ .queue = m.queue };
+    h.warm = if (h.resident) |*r| r.target() else .{ .queue = m.tickQueue() };
 }
 
 pub fn drop(h: anytype) void {
     h.metal.setResident(null);
     if (h.resident) |*r| r.deinit();
     h.resident = null;
-    h.warm = .{ .queue = h.model.queue };
+    h.warm = .{ .queue = h.model.tickQueue() };
 }

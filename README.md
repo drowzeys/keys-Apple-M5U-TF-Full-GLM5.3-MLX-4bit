@@ -4,18 +4,26 @@ Full GLM-5.3 (`glm_moe_dsa`) served on a single Apple M5 Ultra Mac by
 [TensorFold](https://github.com/ashhart/TensorFold), Ash Hart's Zig inference engine, straight from the
 `mlx-community/GLM-5.3-4bit` weights, with MTP speculative decoding through TensorFold's native server.
 
-This is a modified copy of TensorFold 1.3.4 (upstream commit `d30325dc`) with one added model family, `glm_ax`.
-Upstream's own README is kept as [README-TensorFold.md](README-TensorFold.md); what was changed is listed in
-[MODIFICATIONS.md](MODIFICATIONS.md).
+This is a modified copy of TensorFold v1.3.5 (upstream commit `02b324ae`) with one added model family, `glm_ax`.
+Upstream's own README is kept as [README-TensorFold.md](README-TensorFold.md); what was changed, and the code it
+was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 
 - 78 layers, MLA attention with the DSA sparse indexer (top-2048 keys), 256 routed experts (top-8) plus one shared
   expert, and GLM-5.3's one MTP layer as the draft head.
 - Metal kernels using the M5 GPU's tensor units for prompt processing and decode attention.
 - MTP drafts plus context-copy drafts, verified in one pass, through TensorFold's OpenAI-compatible server.
-- One stream at a time (`--parallel 1`); measured up to about 20k tokens of context.
+  Opt-in: a confidence cut for deeper MTP drafts, and the DFlash2 and DSpark drafters.
+- One stream at a time (`--parallel 1`); measured up to about 21k tokens of context.
 
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
+
+## Releases
+
+| Release | Source | What changed |
+|---|---|---|
+| [v0.2.0-glm53-prefill](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill) (this source) | tf33 on TensorFold v1.3.5 | prefill: 4096-row prompt chunks, two-part probabilities, MetalPerformancePrimitives prompt attention; prompt processing is now flat at about 707-718 tok/s from 1.3k to 19.6k tokens. DFlash2 / DSpark / MTP confidence cut added as options |
+| [v0.1.0-glm53-mtp](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp) | tf16 on TensorFold `d30325dc` (1.3.4) | first release: full model + MTP |
 
 ## Measured on
 
@@ -32,61 +40,61 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 
 ### Decode, tokens per second
 
-| Build | Drafts | Prose, T=0.6 | Prose, greedy | Code, greedy | Edit, greedy |
-|---|---|---:|---:|---:|---:|
-| released binary (v0.1.0, published defaults) | MTP, depth 1 | **36.3** | **37.4** | **40.2** | **35.1** |
-| this source (tf16) as benchmarked (fused unembed on) | MTP, depth 1 | 35.8 | 37.1 | 39.3 | 34.0 |
-| previous build (tf15) | MTP, depth 1 | 35.4 | 37.3 | 39.5 | 33.7 |
-| previous build (tf15) | none | 29.4 | 30.0 | 29.9 | - |
+| Build | Drafts (settings) | Prose, T=0.6 | Prose, greedy | Code, greedy | Edit, greedy | Prose at ~16k context |
+|---|---|---:|---:|---:|---:|---:|
+| **v0.2.0 (tf33)** | MTP, depth 1 (`GLM_AX_DRAFT_DEPTH=1`) | **36.5** | **36.6** | **38.6** | **38.5** | **33.0** |
+| v0.2.0 (tf33), option | MTP, depth 2 + confidence cut (`GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7`) | 35.1 | 36.4 | 40.1 | 42.0 | 32.6 |
+| earlier build, option | DSpark (`GLM_AX_DSPARK=<dir>`, `GLM_AX_DSPARK_FLOOR=0.5`) | 30.9 | 32.4 | 43.0 | 49.8 | - |
+| v0.1.0 binary (tf16) | MTP, depth 1 | 36.3 | 37.4 | 40.2 | 35.1 | - |
+| tf16 as first benchmarked (fused unembed on) | MTP, depth 1 | 35.8 | 37.1 | 39.3 | 34.0 | - |
+| tf15 | MTP, depth 1 | 35.4 | 37.3 | 39.5 | 33.7 | 33.3 |
+| tf15 | none | 29.4 | 30.0 | 29.9 | - | - |
 
+- At default settings v0.2.0 decodes prose level with v0.1.0 (36.5 against 36.3 tok/s at T=0.6) and code about 4%
+  lower (38.6 against 40.2); edits are faster (38.5 against 35.1). The gain of this release is prompt processing.
+- For code- and edit-heavy use, `GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7` is recommended: a second MTP draft is
+  offered only while the head's running confidence stays at or above 0.7. A later build makes this the default;
+  in this release it is opt-in (unset, the floor is off and the depth is 3).
+- DSpark (RedHat AI's GLM-5.3 drafter) helps code and edits most but costs prose; its row was measured on an
+  earlier build of the same code, with the drafter from `RedHatAI/GLM-5.3-speculator.dspark`.
 - Prose is fresh essays, code is a new program, edit returns a given 40-line file with small changes.
-- With MTP, 67-96% of drafts were accepted depending on the task. A verify pass of 2 rows takes about 46 ms on the
-  GPU against about 33 ms for a plain 1-row step; the MTP draft pass about 1.2 ms.
-- MTP at about 16k tokens of context (tf15): prose 33.3 tok/s at T=0.6, 33.5 greedy.
-- First token on a short prompt: 0.30-0.35 s (0.85 s for the edit prompt).
-- The released binary's run: verify pass 44.8-47.1 ms on the GPU; first-position draft acceptance 76% for prose
-  at T=0.6 and 93% greedy.
-- Earlier builds measured depth 1 a little ahead of depths 2 and 3 for prose (32.5 / 31.8 / 31.3 tok/s on one
-  older build), so depth 1 is the recommended setting; deeper drafts helped edits on older builds.
+- v0.1.0's run: verify pass 44.8-47.1 ms on the GPU; first-position draft acceptance 76% for prose at T=0.6 and
+  93% greedy.
 
-### Prompt processing (tf16, no drafts)
+### Prompt processing (first-token rate, prompt cache off)
 
-| Prompt | First token | Prompt rate | Decode at that context |
-|---:|---:|---:|---:|
-| 1,284 tokens | 1.93 s | 667 tok/s | 28.4 tok/s |
-| 4,941 tokens | 8.33 s | 593 tok/s | 26.7 tok/s |
-| 19,611 tokens | 34.43 s | 570 tok/s | 25.8 tok/s |
+| Prompt | v0.2.0, no drafts | v0.2.0, MTP server | same family on v1.3.5 without the prefill changes | v0.1.0 (tf16), no drafts |
+|---:|---:|---:|---:|---:|
+| 1,284 tokens | **706 tok/s** (+10%) | 606 tok/s | 640 tok/s | 667 tok/s |
+| 4,941 tokens | **718 tok/s** (+27%) | 675 tok/s | 566 tok/s | 593 tok/s |
+| 19,611 tokens | **707 tok/s** (+37%) | 668 tok/s | 516 tok/s | 570 tok/s |
 
-With the prompt cache on (the server's default), a follow-up turn of the same conversation started in about 0.34 s
-on an earlier build instead of reprocessing the whole conversation.
+Percentages are against the v1.3.5 base column. The rate is prompt tokens / time to the first token (it includes
+tokenizing and one decode pass). With the prompt cache on (the server's default), a follow-up turn of the same
+conversation started in about 0.34 s on an earlier build instead of reprocessing the whole conversation.
 
 Whole decode step without the server (`tf-glm-ax-run`, tf16): 33.9 ms on the GPU at 422 tokens of context
 (22.25 GB read a step, 657 GB/s), 38.5 ms at 19.6k tokens.
 
 ### Correctness checks
 
-- Known answer: "What is the capital city of Australia?" gives "Canberra" (whole model, greedy, before every
-  benchmark run).
-- Needle retrieval: a code hidden in about 6.2k tokens of filler text, and two codes hidden at 10% and 90% of about
-  19.6k tokens, were all returned exactly.
-- Layer probes against MLX (mlx-lm on the same weights), run on an earlier build of this family: after 8 layers
-  of a 3,226-token prompt, the per-row cosine of the fp32 residual was mean 0.9996, min 0.992 over 1,178 rows; on
-  a 24-token prompt, min 0.99998. The published build's decode row (8 layers, position 3,226) matches that checked
-  build at cosine 0.999995.
+v0.2.0 (tf33):
+- Known answer: "What is the capital city of Australia?" gives "Canberra".
+- Needle retrieval: codes hidden in about 6k tokens, and at 10% and 90% of about 20k tokens, were all returned
+  exactly; through the server, a needle at 90% of a 21,125-token prompt was found.
+- With MTP drafts, greedy output equals the undrafted output.
+- 8-layer decode-row probe at position 3,226: cosine 0.999994 against the milestone build that was checked
+  against MLX.
+
+Earlier:
+- Layer probes against MLX (mlx-lm on the same weights), on an earlier build of this family: after 8 layers of a
+  3,226-token prompt, the per-row cosine of the fp32 residual was mean 0.9996, min 0.992 over 1,178 rows; on a
+  24-token prompt, min 0.99998.
+- The v0.1.0 binary was run on the model after publishing: SHA-256 matched, Canberra passed, a greedy essay with
+  MTP drafts was byte-identical to the undrafted one, and a needle at 90% of a 21,125-token prompt was found.
 - The fused decode paths (absorb + rope, unembed) are bit-identical to the unfused ones.
-- The released v0.1.0 binary was itself run on the model after publishing: its SHA-256 matched, the Canberra check
-  passed, a greedy essay with MTP drafts was byte-identical to the same request without drafts, and a needle at 90%
-  depth of a 21,125-token prompt was found (first answer after 38.8 s).
 
 The output is not bit-identical to MLX: the kernels sum in a different order (fp32 sums of exact bf16 products).
-
-### Which build is this
-
-This repository is the `tf16` source tree. It was benchmarked with the fused unembed path switched on; afterwards
-that path was put behind `GLM_AX_FUSE_UNEMBED=1` (off by default) because it was about 0.5 ms a step slower and
-bit-identical. The defaults published here (absorb fusion on, fused unembed off, fused MoE off, residency set off)
-were then measured with the released binary (first row of the decode table). Set `GLM_AX_FUSE_UNEMBED=1` to get the
-earlier benchmarked configuration.
 
 ## Memory
 
@@ -139,12 +147,13 @@ server-less runner.
 
 ### Prebuilt binary
 
-The [v0.1.0-glm53-mtp release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp)
-has `tensorfold-native` built from this source (`zig build native`, fast mode, Xcode 27.2 Metal toolchain) as a
-.tar.gz with its SHA-256, plus the licence files. It needs macOS 27.2.1 or later (the SDK it was built with). It is
-ad-hoc signed, not notarized: after downloading, run `xattr -d com.apple.quarantine tensorfold-native`. No weights
-are included. This exact binary was run on the model after publishing (see Results: decode table and correctness
-checks).
+The [v0.2.0-glm53-prefill release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill)
+has `tensorfold-native` built from this source (`zig build native`, fast mode, Zig 0.17.0, Xcode 27.2 Metal
+toolchain) as a .tar.gz with its SHA-256, plus the licence files. It needs macOS 27.2.1 or later (the SDK it was
+built with). It is ad-hoc signed, not notarized: after downloading, run
+`xattr -d com.apple.quarantine tensorfold-native`. No weights are included. The
+[v0.1.0 release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp)
+stays available (its source is commit `7446f69`).
 
 ## Serve
 
@@ -156,7 +165,8 @@ GLM_AX_LOAD_LIMIT_GB=440 GLM_AX_DRAFT_DEPTH=1 \
 ```
 
 The benchmarks added `--prompt-cache-gib 0`; leave it out for normal use so follow-up turns reuse the cache. Pass
-`--no-drafts` (and the plain pack folder) to serve without speculative decoding.
+`--no-drafts` (and the plain pack folder) to serve without speculative decoding. For code and edits, use
+`GLM_AX_DRAFT_DEPTH=2 GLM_AX_MTP_FLOOR=0.7` instead of `GLM_AX_DRAFT_DEPTH=1`.
 
 Then, for example:
 
@@ -170,7 +180,12 @@ curl -s 127.0.0.1:8020/v1/chat/completions -H 'Content-Type: application/json' \
 | Variable | Effect |
 |---|---|
 | `GLM_AX_LOAD_LIMIT_GB` | load limit in GB (default 75% of RAM); 440 was used |
-| `GLM_AX_DRAFT_DEPTH` | MTP drafts a window holds, 1-3 (default 3); 1 was used and is recommended |
+| `GLM_AX_DRAFT_DEPTH` | MTP drafts a window holds, 1-3 (default 3); 1 is recommended for prose, 2 with the floor below for code and edits |
+| `GLM_AX_MTP_FLOOR` | 0-1: verify a draft past the first only while the MTP head's running confidence (product of its drafts' top probabilities) stays at or above it, and stop drafting there; unset = off |
+| `GLM_AX_DSPARK=<dir>` | use RedHat AI's DSpark drafter (`RedHatAI/GLM-5.3-speculator.dspark`) instead of MTP; `GLM_AX_DSPARK_FLOOR` sets its confidence cut (0.5 measured), `GLM_AX_DSPARK_DEPTH` its most drafts (1-8) |
+| `GLM_AX_DFLASH2=<dir>` | use a DFlash2 drafter for GLM-5.3 (for example `incoai/GLM-5.3-DFlash2`) instead of MTP; `GLM_AX_DFLASH2_DEPTH` 1-7. Experimental: no numbers are published for it in this README |
+| `GLM_AX_NO_MPP=1` | prompt attention by the older tensor-unit kernel instead of the MetalPerformancePrimitives one |
+| `GLM_AX_METAL4=1` | run glm_ax on a Metal 4 queue (experimental; Metal 3 by default) |
 | `GLM_AX_FUSE_UNEMBED=1` | fused unembed for decode rows (bit-identical, measured slightly slower) |
 | `GLM_AX_MOE_FUSED=1` | fused decode MoE (bit-identical; slower on the measured runs) |
 | `GLM_AX_RESIDENCY=1` | hold the weights in a Metal residency set (measured no decode gain, slower prompt after idle) |
@@ -192,10 +207,11 @@ The scripts use only the Python standard library.
 ## Limitations
 
 - Single stream only (`--parallel 1`).
-- Measured up to about 20k tokens of context; longer contexts (up to the 32k the server was started with, or
+- Measured up to about 21k tokens of context; longer contexts (up to the 32k the server was started with, or
   beyond) were not measured.
 - Not bit-identical to MLX (summation order), see above.
-- DFlash2 drafting is not in this build; drafts are GLM-5.3's MTP head plus context copies.
+- The DFlash2 drafter path is in the code but not benchmarked for this README; the DSpark row comes from an
+  earlier build.
 - Only the MLX affine 4-bit (group 64) layout of `mlx-community/GLM-5.3-4bit` was tested.
 - Built and tested on an M5 Ultra only. The prompt kernels need the M5 generation's GPU tensor units.
 
@@ -213,6 +229,14 @@ The scripts use only the Python standard library.
   (same GLM-5.3 License).
 - [inferencerlabs/GLM-5.3-MTP-MLX](https://huggingface.co/inferencerlabs/GLM-5.3-MTP-MLX): GLM-5.3's MTP layer
   extracted and quantised for MLX (ships the GLM-5.3 License).
+- [Splash](https://github.com/incoai/splash) (Apache-2.0): `glm_ax_mpp.metal` adapts its
+  `listed_attention.metal` kernel, which ports the tensor-unit sparse MLA method of
+  [oMLX](https://github.com/jundot/omlx) 0.8.0rc1 (`sparse_mla_nax.py`, Apache-2.0).
+- DSpark: [RedHatAI/GLM-5.3-speculator.dspark](https://huggingface.co/RedHatAI/GLM-5.3-speculator.dspark) (under the
+  GLM-5.3 License; not included), with semantics from RedHat AI's
+  [speculators](https://github.com/vllm-project/speculators) and [vLLM](https://github.com/vllm-project/vllm)
+  (Apache-2.0). DFlash2: [incoai/GLM-5.3-DFlash2](https://huggingface.co/incoai/GLM-5.3-DFlash2) (Apache-2.0; not
+  included), semantics from [SGLang](https://github.com/sgl-project/sglang) (Apache-2.0).
 - [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple (MIT): the
   weight format, and the reference the layer probes were compared against.
 - Multi-token prediction: Gloeckle et al., "Better & Faster Large Language Models via Multi-token Prediction"

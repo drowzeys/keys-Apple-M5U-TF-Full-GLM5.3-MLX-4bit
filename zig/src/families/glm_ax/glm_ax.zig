@@ -10,3 +10,5 @@ pub const residency = @import("residency.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const kernel_sources = @import("kernel_sources");
 pub const draw = @import("draw.zig");
+pub const dflash2 = @import("dflash2.zig");
+pub const dspark = @import("dspark.zig");

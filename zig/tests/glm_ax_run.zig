@@ -1,5 +1,7 @@
 //! GLM-5.3 on MLX affine weights without the server: a prompt's chunks, a greedy reply, timings and dumps.
 const std = @import("std");
+/// The Metal wrapper compiles Metal 4 in (GLM_AX_METAL4=1 takes it at run time).
+pub const tf_metal4 = true;
 const platform = @import("sys");
 const tf = @import("tensorfold");
 const tok = @import("tokenizer");
@@ -98,7 +100,12 @@ fn once(m: *g.Model, io: std.Io, t: *const tok.Tokenizer, scratch: *g.state.Scra
     while (at < prompt.len) {
         const n = @min(chunk, prompt.len - at);
         const s = if (n > g.state.window_rows) big else scratch;
+        const tc = std.Io.Timestamp.now(io, .awake);
         try g.forward.run(m, s, cache, prompt[at .. at + n], .{ .all = forced, .head = head, .hidden = if (head) .{ .buf = s.hid } else null, .profile = if (profiling) &pprof else null });
+        if (platform.c.getenv("GLM_CHUNK_TRACE") != null) {
+            const dt = seconds(io, tc);
+            std.debug.print("chunk at {d}: {d} rows in {d:.1} ms = {d:.0} tok/s (GPU {d:.1} ms)\n", .{ at, n, 1000 * dt, @as(f64, @floatFromInt(n)) / dt, 1000 * s.last_gpu });
+        }
         if (forced) for (0..n) |r| {
             const pick = argmax(s.logits_all.slice(u16, n * c.vocab)[r * c.vocab ..][0..c.vocab]);
             if (at + r + 1 < prompt.len and pick == prompt[at + r + 1]) agree += 1;
@@ -200,6 +207,34 @@ fn once(m: *g.Model, io: std.Io, t: *const tok.Tokenizer, scratch: *g.state.Scra
     const steps = reply.items.len - 1;
     std.debug.print("decode: {d} tokens in {d:.3} s = {d:.2} tok/s ({d:.2} ms a token) at context {d}\n", .{ steps, t_decode, @as(f64, @floatFromInt(steps)) / t_decode, 1000.0 * t_decode / @as(f64, @floatFromInt(@max(steps, 1))), cache.len });
     if (profiling) report("decode", &dprof, steps);
+    if (env("GLM_ROWCHECK", 0) > 0) {
+        // a window of the reply's first n tokens against the same tokens one row at a time: bits of every row's logits
+        for ([_]usize{ 2, 3, 4, 8 }) |want| {
+        const n: usize = @min(want, @min(g.state.window_rows, reply.items.len));
+        const base = prompt.len;
+        const keep_len = cache.len;
+        cache.len = base;
+        try g.forward.run(m, scratch, cache, reply.items[0..n], .{ .all = true });
+        const V = c.vocab;
+        const win = try a.alloc(u16, n * V);
+        defer a.free(win);
+        @memcpy(win, scratch.logits_all.slice(u16, n * V));
+        var same: usize = 0;
+        var worst: f32 = 0;
+        var argmax_same: usize = 0;
+        for (0..n) |r| {
+            cache.len = base + r;
+            try g.forward.run(m, scratch, cache, reply.items[r .. r + 1], .{ .all = true });
+            const one = scratch.logits_all.slice(u16, V);
+            const w = win[r * V ..][0..V];
+            if (std.mem.eql(u16, one, w)) same += 1;
+            for (one, w) |x, y| worst = @max(worst, @abs(@as(f32, @bitCast(@as(u32, x) << 16)) - @as(f32, @bitCast(@as(u32, y) << 16))));
+            if (argmax(one) == argmax(w)) argmax_same += 1;
+        }
+        cache.len = keep_len;
+        std.debug.print("rowcheck: a {d}-row window against one row at a time: {d}/{d} rows' logits bit-identical, same argmax {d}/{d}, max |diff| {d:.4}\n", .{ n, same, n, argmax_same, n, worst });
+        }
+    }
     if (env("GLM_KBENCH", 0) > 0) try kbench(m, scratch, cache, next, reply.items, @intCast(env("GLM_KBENCH", 0)), steps, t_decode);
     std.debug.print("ids:", .{});
     for (reply.items) |id| std.debug.print(" {d}", .{id});
@@ -222,6 +257,11 @@ fn linBytes(w: g.weights.Linear) f64 {
 }
 
 /// Bytes a one-row step of `stage` reads over the whole stack (weights, and keys at the cache's length).
+/// One expert's code bytes (the 4-bit words only).
+fn linBytesW(x: anytype) usize {
+    return x.one.n * x.one.k / 2;
+}
+
 fn stageBytes(m: *const g.Model, stage: g.forward.Stage, len: usize, experts_per_layer: f64) f64 {
     const c = &m.config;
     var total: f64 = 0;
@@ -271,29 +311,35 @@ fn kbench(m: *g.Model, scratch: *g.state.Scratch, cache: *g.state.Cache, token: 
     var bytes_all: f64 = 0;
     inline for (@typeInfo(g.forward.Stage).@"enum".field_names, 0..) |_, i| bytes_all += stageBytes(m, @enumFromInt(i), cache.len, per_layer);
     if (env("GLM_KBENCH_STREAM", 1) > 0) {
-        // the reference: a plain streaming read of a 4 GiB buffer in one launch, the best of 5
-        const gib4: usize = 4 << 30;
-        const buf = try m.device.buffer(gib4, mtl.ResourceOptions.private);
-        defer buf.deinit();
-        const out = try m.device.buffer(64 * 1024, mtl.ResourceOptions.shared);
+        // the reference: a plain streaming read of the model's own resident routed-expert weights (every MoE layer's
+        // gate, up and down codes), one launch a matrix in one command buffer, the best of 5
+        const out = try m.device.buffer(1 << 20, mtl.ResourceOptions.shared);
         defer out.deinit();
-        const per: usize = 65536; // uint4s a threadgroup: 1 MiB
-        const groups = gib4 / 16 / per;
+        const per: usize = 4096; // uint4s a threadgroup: 64 KiB
         var best: f64 = 1e9;
+        var total: usize = 0;
         for (0..6) |rep| {
             const cb = m.queue.commandBuffer();
             const e = cb.compute(.serial);
             e.setPipeline(m.kernel(.stream));
-            e.setBuffer(buf, 0, 0);
-            e.setValue(g.forward.GArgs{ .width = @intCast(per) }, 1);
-            e.setBuffer(out, 0, 2);
-            e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(256, 1, 1));
+            total = 0;
+            for (m.weights.layers[0..m.weights.main]) |l| if (l.ffn == .moe) for ([_]@TypeOf(l.ffn.moe.gate){ l.ffn.moe.gate, l.ffn.moe.up, l.ffn.moe.down }) |x| {
+                const bytes = x.one.w.length() - x.one.w_off;
+                const want = @min(bytes, x.experts * linBytesW(x));
+                const groups = want / 16 / per;
+                if (groups == 0) continue;
+                e.setBuffer(x.one.w, x.one.w_off, 0);
+                e.setValue(g.forward.GArgs{ .width = @intCast(per) }, 1);
+                e.setBuffer(out, 0, 2);
+                e.dispatchGroups(mtl.Size.of(groups, 1, 1), mtl.Size.of(256, 1, 1));
+                total += groups * per * 16;
+            };
             e.end();
             cb.commit();
             cb.wait();
             if (rep > 0) best = @min(best, cb.gpuSeconds());
         }
-        std.debug.print("kernel bench: streaming-read reference, 4 GiB in one launch: {d:.3} ms = {d:.0} GB/s (best of 5)\n", .{ 1000.0 * best, @as(f64, @floatFromInt(gib4)) / 1e9 / best });
+        std.debug.print("kernel bench: streaming-read reference, the routed experts' codes ({d:.1} GB, a launch a matrix): {d:.2} ms = {d:.0} GB/s (best of 5)\n", .{ @as(f64, @floatFromInt(total)) / 1e9, 1000.0 * best, @as(f64, @floatFromInt(total)) / 1e9 / best });
     }
     std.debug.print("kernel bench, {d} row(s), at context {d}: a whole step {d:.2} ms GPU (wall {d:.2} ms a decoded token), {d} dispatches a step, {d:.2} GB read = {d:.0} GB/s\n", .{ nrows, cache.len, step_ms, 1000.0 * t_decode / @as(f64, @floatFromInt(@max(steps, 1))), disp / reps, bytes_all / 1e9, bytes_all / 1e9 / (step_ms / 1000.0) });
     var sum: f64 = 0;
