@@ -64,7 +64,7 @@ fn mat(w: wts.Linear) struct { w: B, s: B, b: B, n: u32, k: u32 } {
 }
 
 /// Stage timing: with a profile, each stage runs in its own command buffer and its GPU time is added to its slot.
-pub const Stage = enum { embed, norm, proj_x, prep, proj_q, index, absorb, attend, unembed, o_proj, route, experts, shared, dense, moe_add, head };
+pub const Stage = enum { embed, norm, proj_x, prep, proj_q, index, topk, absorb, attend, unembed, o_proj, route, experts, shared, dense, moe_add, head };
 pub const Profile = struct {
     gpu: [@typeInfo(Stage).@"enum".field_names.len]f64 = @splat(0),
     wall: f64 = 0,
@@ -150,7 +150,10 @@ const Enc = struct {
             // product (each weight read once for every row; the row kernels re-read it a pair of rows at a time)
             affine_mm.rowSums(x.e, x.m.mm, @intCast(w.group), bo(in, in_off), b(x.s.sums), @intCast(n_rows), @intCast(w.k));
             x.e.barrier();
-            affine_mm.dense(x.e, x.m.mm, bo(in, in_off), b(x.s.sums), mat(w), bo(out, out_off), @intCast(n_rows));
+            const mg = @import("model.zig").mm_groups;
+            if (x.m.mmg != null and w.k >= mg.dense_from and w.bits == 4 and w.group == 64 and n_rows > st.window_rows) {
+                mg.dense(x.e, x.m.mmg.?, bo(in, in_off), b(x.s.sums), mat(w), bo(out, out_off), @intCast(n_rows), .{});
+            } else affine_mm.dense(x.e, x.m.mm, bo(in, in_off), b(x.s.sums), mat(w), bo(out, out_off), @intCast(n_rows));
             return;
         }
         // GLM_AX_SPLIT_ROWS=1: a 2-4 row window as one-row launches side by side (the one-row kernel's occupancy)
@@ -626,6 +629,21 @@ fn expertsByExpert(x: Enc, e: wts.Moe, n: usize) !void {
     const p = x.m.mm;
     const ex: u32 = c.experts;
     x.glue(.sort, Args{ .rows = slots, .width = ex }, &.{ b(s.pick), A, b(s.offsets), b(s.order) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, true);
+    if (std.c.getenv("GLM_AX_NO_GLU") == null) {
+        // gate, up and SwiGLU in one gathered product over the unsorted rows (core affine_mm.gatherGlu, as the
+        // GLM-5.3-Flash family's prompt runs them): no sorted copy of x, no gate/up round trip through memory
+        x.e.barrier();
+        affine_mm.rowSums(x.e, p, @intCast(e.gate.one.group), b(s.x), b(s.sums), @intCast(n), c.hidden);
+        x.e.barrier();
+        const mg = @import("model.zig").mm_groups;
+        const groups = if (x.m.mmg != null and mg.fits(e.gate.one, e.down.one)) x.m.mmg else null;
+        if (groups) |gp| mg.gatherGlu(x.e, gp, b(s.x), b(s.sums), mat(e.gate.one), mat(e.up.one), b(s.offsets), b(s.order), b(s.ea), slots, ex, c.topk, no_limit) else affine_mm.gatherGlu(x.e, p, b(s.x), b(s.sums), mat(e.gate.one), mat(e.up.one), b(s.offsets), b(s.order), b(s.ea), slots, ex, c.topk, no_limit);
+        x.e.barrier();
+        affine_mm.rowSums(x.e, p, @intCast(e.down.one.group), b(s.ea), b(s.sums), slots, c.moe_inter);
+        x.e.barrier();
+        if (groups) |gp| mg.gatherTo(x.e, gp, b(s.ea), b(s.sums), mat(e.down.one), b(s.offsets), b(s.ey), b(s.order), slots, ex) else affine_mm.gatherTo(x.e, p, b(s.ea), b(s.sums), mat(e.down.one), b(s.offsets), b(s.ey), b(s.order), slots, ex);
+        return;
+    }
     x.glue(.rows_by_order, Args{ .rows = slots, .width = c.hidden, .heads = c.topk }, &.{ b(s.x), b(s.order), A, b(s.xs) }, .{ c.hidden, slots, 1 }, .{ 256, 1, 1 }, false);
     x.e.barrier();
     affine_mm.rowSums(x.e, p, @intCast(e.gate.one.group), b(s.xs), b(s.sums), slots, c.hidden);
@@ -695,7 +713,9 @@ fn attention(x: *Enc, cache: *st.Cache, w: wts.Attention, i: usize, start: usize
                     x.e.dispatchGroups(mtl.Size.of(last / 64 + 1, (blk + 63) / 64, 1), mtl.Size.of(128, 1, 1));
                 }
             } else if (last >= c.i_topk) x.own(.index_scores, a, &.{ bo(s.iq, r0 * iq_row), bo(s.qa, (r0 * px + wts.wp_col) * 2), bo(cache.index, cache.indexKeys(i)), bo(s.rowtab, r0 * rt), A, b(s.score), b(m.inv) }, .{ last / 256 + 1, blk, 1 }, .{ 128, 1, 1 }, true);
+            try x.mark(.topk);
             x.own(.index_topk, a, &.{ b(s.score), bo(s.rowtab, r0 * rt), A, b(s.keys) }, .{ blk, 1, 1 }, .{ 1024, 1, 1 }, true);
+            try x.mark(.index);
         }
     }
     // each head's latent query (embed_q of its 192 nope dims) and its roped 64

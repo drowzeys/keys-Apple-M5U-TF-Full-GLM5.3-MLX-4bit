@@ -14,6 +14,8 @@ The glm_ax Metal kernels were derived from TensorFold's own GLM-5.3-Flash
 kernels (glm_sparse_nax, glm_index_nax and their split/combine decode path) and
 build on TensorFold's core row-projection, affine matmul and MoE routing code.
 The drafter ports reuse TensorFold's MiniMax-M3 DFlash2/DSpark kernels.
+Prompt experts use TensorFold's core affine_mm.gatherGlu, as its GLM-5.3-Flash
+family does.
 
 zig/kernels/metal/glm_ax/glm_ax_mpp.metal (prompt attention) contains code adapted
 from Splash (https://github.com/incoai/splash, commit d23cfa1f, Apache-2.0),

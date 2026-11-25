@@ -12,6 +12,8 @@ const frags = @import("../../core/frags.zig");
 const file_cache = @import("../../core/checkpoint_file_cache.zig");
 const weights = @import("weights.zig");
 const dflash2 = @import("dflash2.zig");
+/// The GLM-5.3-Flash family's column-group products (core affine_mm's bits, faster): prompt experts and deep products.
+pub const mm_groups = @import("../glm/mm_groups.zig");
 const lanes = @import("lanes");
 
 pub const own_names = [_][:0]const u8{ "gx_norm", "gx_norm16", "gx_add", "gx_prep", "gx_qrope", "gx_attend", "gx_merge", "gx_index_key", "gx_index_scores", "gx_index_topk", "gx_index_qrope", "gx_swiglu", "gx_add_norm", "gx_moe_add_norm", "gx_heads_gemv", "gx_route_rows", "gx_moe_gu", "gx_moe_down", "gx_absorb", "gx_stream" };
@@ -47,6 +49,8 @@ pub const Model = struct {
     /// Prompt chunks' attention by MetalPerformancePrimitives (glm_ax_mpp.metal; oMLX's and Splash's method: measured
     /// attention 49 -> 76 TFLOPS, prefill +10-12%); null with GLM_AX_NO_MPP=1 (gx_sparse_nax).
     sparse_mpp: ?mtl.Pipeline = null,
+    /// mm_groups' pipelines (GLM_AX_GROUPS=1; null: core affine_mm's).
+    mmg: ?mm_groups.Pipes = null,
     /// core/qwen_vision.metal's bf16 tensor-unit GEMM, y = x w^T (fp32 sums, bf16 out), by (M % 64 == 0, N % 128 == 0).
     gemm: [4]mtl.Pipeline,
     /// The fused decode MoE on core/row_projection.metal's row reduction (glm_ax_moe.metal): gate/up/SwiGLU, down.
@@ -84,6 +88,7 @@ pub const Model = struct {
         // the fields with defaults, set (create leaves them undefined)
         m.tick_queue = null;
         m.sparse_mpp = null;
+        m.mmg = null;
         m.taps = 0;
         m.tap_at = @splat(-1);
         m.window_costs_n = 0;
@@ -209,6 +214,17 @@ pub const Model = struct {
         }
         errdefer m.sparse_nax.deinit();
         errdefer m.index_nax.deinit();
+        // opt-in (GLM_AX_GROUPS=1): wired this way, glm_ax's prompts came out wrong and slower (to be investigated)
+        if (std.c.getenv("GLM_AX_GROUPS") != null) {
+            const text = try mm_groups.source(m.device, gpa);
+            defer gpa.free(text);
+            const lib = try mtl.Library.fromSource(m.device, text, mtl.CompileOptions.mlx());
+            defer lib.deinit();
+            var pp: mm_groups.Pipes = undefined;
+            for (mm_groups.names, 0..) |nm, i| pp[i] = try mtl.Pipeline.init(m.device, lib, nm, false);
+            m.mmg = pp;
+        }
+        errdefer if (m.mmg) |pp| for (pp) |x| x.deinit();
         m.sparse_mpp = null;
         if (std.c.getenv("GLM_AX_NO_MPP") == null) {
             const lib = try mtl.Library.fromSource(m.device, ks.glm_ax_mpp, mtl.CompileOptions.mlx());
@@ -277,6 +293,7 @@ pub const Model = struct {
         m.inv.deinit();
         m.sparse_nax.deinit();
         if (m.sparse_mpp) |p| p.deinit();
+        if (m.mmg) |pp| for (pp) |x| x.deinit();
         m.index_nax.deinit();
         m.sparse_split.deinit();
         m.sparse_combine.deinit();

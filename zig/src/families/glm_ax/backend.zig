@@ -34,7 +34,8 @@ pub const max_drafts = 3;
 
 /// GLM_AX_DRAFT_DEPTH (1-3): the most drafts a window holds, for depth trials; max_drafts when unset.
 fn depthCap() usize {
-    const v = std.c.getenv("GLM_AX_DRAFT_DEPTH") orelse return max_drafts;
+    // default 2: the second draft offered only while the head's running chance holds (mtpFloor)
+    const v = std.c.getenv("GLM_AX_DRAFT_DEPTH") orelse return 2;
     const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return max_drafts;
     return @max(1, @min(n, max_drafts));
 }
@@ -43,7 +44,10 @@ fn depthCap() usize {
 /// chance (the product of its drafts' max probabilities) stays at or above it, and the head stops drafting there
 /// (no second MTP pass for a draft that would not be verified); null when unset (every requested draft runs).
 fn mtpFloor() ?f64 {
-    const v = std.c.getenv("GLM_AX_MTP_FLOOR") orelse return null;
+    // default 0.7 (measured: prose 36.6, greedy 38.2, code 42.4, edit 42.8 against depth 1's 35.8 / 37.1 / 38.9 /
+    // 38.5); GLM_AX_MTP_FLOOR=off verifies every requested draft
+    const v = std.c.getenv("GLM_AX_MTP_FLOOR") orelse return 0.7;
+    if (std.mem.eql(u8, std.mem.span(v), "off")) return null;
     const f = std.fmt.parseFloat(f64, std.mem.span(v)) catch return null;
     return if (f >= 0 and f <= 1) f else null;
 }

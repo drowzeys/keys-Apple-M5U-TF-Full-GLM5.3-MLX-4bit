@@ -6,6 +6,7 @@ unchanged. Upstream's history is not included: each release of this repository i
 
 | Release here | Upstream base | glm_ax build |
 |---|---|---|
+| v0.2.1-glm53-prefill | v1.3.5 (`02b324ae`) | tf39: 8192-row prompt chunks, fused gate/up/SwiGLU prompt experts; MTP default depth 2 + cut 0.7 |
 | v0.2.0-glm53-prefill | v1.3.5 (`02b324ae`) | tf33: prefill changes, DFlash2/DSpark/confidence cut opt-in |
 | v0.1.0-glm53-mtp | `d30325dc` (1.3.4) | tf16 |
 
@@ -46,6 +47,9 @@ unchanged. Upstream's history is not included: each release of this repository i
   The DFlash2 drafter follows the semantics of SGLang's `DFlash2DraftModel` (Apache-2.0); the DSpark drafter
   follows RedHat AI's speculators (`DSparkDraftModel`) and vLLM's `qwen3_dspark` / dspark speculator code (both
   Apache-2.0). Those projects were read for semantics only; no source text from them is included.
+- The prompt's routed experts use TensorFold's core `affine_mm.gatherGlu` (fused gate/up/SwiGLU), as upstream's
+  GLM-5.3-Flash family does. An opt-in path (`GLM_AX_GROUPS=1`) reuses that family's `glm/mm_groups.zig`
+  column-group kernels; it is experimental and currently gives wrong output with glm_ax.
 - The model's math (MLA with weight absorption, the DSA indexer, sigmoid routing with the correction bias, the MTP
   block) follows the published GLM-5.3 architecture.
 
