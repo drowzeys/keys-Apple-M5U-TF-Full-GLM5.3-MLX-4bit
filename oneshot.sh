@@ -10,8 +10,8 @@
 #   prose  MTP depth 1, no confidence cut, 32k context
 #   code   built-in MTP default (depth 2 + 0.7 confidence cut), 32k context
 #   long   bf16 cache, MTP depth 1, 393,216-token context
-#   1m     8-bit cache, no MTP head, 1,048,576-token context
-#   long-mtp  8-bit cache with MTP: being measured, not available yet
+#   1m     8-bit cache, MTP depth 1, 1,048,576-token context
+#   1m-nomtp  8-bit cache, no MTP head, 1,048,576-token context
 #
 # Nothing here uses sudo except the optional wired-limit step, which is only run after you answer yes.
 # Bash 3.2 compatible (the macOS system bash).
@@ -44,7 +44,7 @@ usage() {
   cat <<'EOF'
 
 Options:
-  --preset NAME     prose | code | long | 1m   (required for a run)
+  --preset NAME     prose | code | long | 1m | 1m-nomtp   (required for a run)
   --dir PATH        where the binary, logs, merged model folder and (if needed) the weights go
                     (default ~/glm53-tf)
   --release TAG     release tag to fetch the binary from (default: the latest release)
@@ -114,17 +114,21 @@ preset_setup() {
       MEASURED="375,314-token needle found; first token 784 s (about 479 tok/s); decode 20.3 tok/s with MTP depth 1"
       ;;
     1m)
+      ENVS="GLM_AX_K8=1 GLM_AX_PROMPT_ROWS=1024 GLM_AX_LOAD_LIMIT_GB=495 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off"
+      FLAGS="--context 1048576 --parallel 1 --reasoning-effort low --prompt-cache-gib 0 --no-update-check"
+      MODEL_KIND=mtp
+      NEED="peak wired 453.4 GiB at a 1,026,813-token prompt (lowest reclaimable 54.1 GiB); nothing else large may run"
+      MEASURED="1,026,813-token needle found; first token 3,802 s (63 min); decode 9.6 tok/s with MTP depth 1"
+      ;;
+    1m-nomtp)
       ENVS="GLM_AX_K8=1 GLM_AX_PROMPT_ROWS=2048 GLM_AX_LOAD_LIMIT_GB=495 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off"
       FLAGS="--context 1048576 --parallel 1 --reasoning-effort low --prompt-cache-gib 0 --no-drafts --no-update-check"
       MODEL_KIND=plain
       NEED="peak wired 449.1 GiB at a 1,026,813-token prompt (lowest reclaimable about 50 GiB); nothing else large may run"
       MEASURED="1,026,813-token needle found; first token 3,495 s (58 min, about 294 tok/s); decode 7.4 tok/s (no MTP head)"
       ;;
-    long-mtp)
-      die "preset long-mtp (8-bit cache with the MTP head, expected about 850-900k context) is still being measured; use 'long' (393k, MTP) or '1m' (no MTP) for now"
-      ;;
-    "") die "--preset is required: prose | code | long | 1m" ;;
-    *) die "unknown preset '$PRESET': prose | code | long | 1m" ;;
+    "") die "--preset is required: prose | code | long | 1m | 1m-nomtp" ;;
+    *) die "unknown preset '$PRESET': prose | code | long | 1m | 1m-nomtp" ;;
   esac
 }
 
@@ -227,20 +231,51 @@ find_snapshot() {
   return 1
 }
 
+# hf_cli: print the command that runs the Hugging Face CLI (it may sit outside PATH, e.g. after pip install --user)
 hf_cli() {
-  if command -v hf >/dev/null; then echo hf
-  elif command -v huggingface-cli >/dev/null; then echo huggingface-cli
-  else echo ""; fi
+  local d ub
+  if command -v hf >/dev/null; then echo hf; return; fi
+  if command -v huggingface-cli >/dev/null; then echo huggingface-cli; return; fi
+  ub="$(python3 -m site --user-base 2>/dev/null || true)"
+  for d in "${HOME}/.local/bin" "${ub:+${ub}/bin}"; do
+    [ -n "$d" ] || continue
+    if [ -x "${d}/hf" ]; then echo "${d}/hf"; return; fi
+    if [ -x "${d}/huggingface-cli" ]; then echo "${d}/huggingface-cli"; return; fi
+  done
+  if python3 -c 'import huggingface_hub.cli.hf' >/dev/null 2>&1; then
+    echo "python3 -m huggingface_hub.cli.hf"; return
+  fi
+  if python3 -c 'import huggingface_hub.commands.huggingface_cli' >/dev/null 2>&1; then
+    echo "python3 -m huggingface_hub.commands.huggingface_cli"; return
+  fi
+  echo ""
+}
+
+# need_hf_cli: find the CLI, or offer to install huggingface_hub for this user (no sudo)
+need_hf_cli() {
+  local cli ans="n"
+  cli="$(hf_cli)"
+  if [ -n "$cli" ]; then echo "$cli"; return; fi
+  if [ "$DRY" -eq 1 ]; then
+    printf '   $ python3 -m pip install --user -U huggingface_hub   (offered when no hf CLI is found)\n' >&2
+    echo hf; return
+  fi
+  printf '   No Hugging Face CLI found (hf, huggingface-cli, ~/.local/bin, the python user bin).\n' >&2
+  if [ "$YES" -eq 1 ]; then ans="y"; elif [ -t 0 ]; then read -r -p "   Install it now with 'python3 -m pip install --user -U huggingface_hub'? [y/N] " ans; fi
+  case "$ans" in
+    y|Y|yes) python3 -m pip install --user -U huggingface_hub >&2 ;;
+    *) die "install it with: python3 -m pip install --user -U huggingface_hub" ;;
+  esac
+  cli="$(hf_cli)"
+  [ -n "$cli" ] || die "huggingface_hub installed but no CLI found; add $(python3 -m site --user-base)/bin to PATH"
+  echo "$cli"
 }
 
 # get_snapshot REPO REV DISK_GB: echo the snapshot folder, downloading it (resumable) when it is not cached
 get_snapshot() {
   local repo="$1" rev="$2" gb="$3" found cli free
   if found="$(find_snapshot "$repo" "$rev")"; then info "found in the Hugging Face cache: $found" >&2; echo "$found"; return; fi
-  cli="$(hf_cli)"
-  if [ -z "$cli" ]; then
-    if [ "$DRY" -eq 1 ]; then cli=hf; else die "no 'hf' or 'huggingface-cli' found: python3 -m pip install -U huggingface_hub"; fi
-  fi
+  cli="$(need_hf_cli)"
   if [ "$DRY" -eq 0 ]; then
     mkdir -p "$DIR"
     free=$(df -g "$DIR" | awk 'NR==2{print $4}')
@@ -248,7 +283,8 @@ get_snapshot() {
   fi
   info "downloading $repo at $rev into ${DIR}/hf (resumable: rerun to continue)" >&2
   printf '   $ HF_HOME=%s %s download %s --revision %s\n' "${DIR}/hf" "$cli" "$repo" "$rev" >&2
-  if [ "$DRY" -eq 0 ]; then HF_HOME="${DIR}/hf" "$cli" download "$repo" --revision "$rev" >&2; fi
+  # shellcheck disable=SC2086 # cli may be "python3 -m ..." (a word list)
+  if [ "$DRY" -eq 0 ]; then HF_HOME="${DIR}/hf" $cli download "$repo" --revision "$rev" >&2; fi
   echo "${DIR}/hf/hub/models--${repo//\//--}/snapshots/${rev}"
 }
 

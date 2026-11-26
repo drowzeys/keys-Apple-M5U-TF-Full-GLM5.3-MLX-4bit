@@ -14,8 +14,8 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 - MTP drafts plus context-copy drafts, verified in one pass, through TensorFold's OpenAI-compatible server. The
   default is two MTP drafts with a confidence cut (best for code and edits); prose is best at one draft. Opt-in:
   the DFlash2 and DSpark drafters.
-- Up to 1,048,576 tokens of context (GLM-5.3's full window) with the opt-in 8-bit KV cache: a needle was found in
-  a 1,026,813-token prompt. With the bf16 cache and MTP, up to 393,216 tokens.
+- Up to 1,048,576 tokens of context (GLM-5.3's full window) with the opt-in 8-bit KV cache and the MTP head: a
+  needle was found in a 1,026,813-token prompt, decode 9.6 tok/s. With the bf16 cache, up to 393,216 tokens.
 - One stream at a time (`--parallel 1`) by default.
 
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
@@ -32,7 +32,7 @@ wired limit, starts the server and waits for a "Canberra" smoke answer.
 git clone https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit.git
 cd keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit
 ./oneshot.sh --preset prose --dry-run     # print every step and command, change nothing
-./oneshot.sh --preset prose               # or: code | long | 1m
+./oneshot.sh --preset prose               # or: code | long | 1m | 1m-nomtp
 ./oneshot.sh --status                     # / --stop
 ```
 
@@ -45,8 +45,8 @@ and run it the same way (it then fetches the merge script from the repository). 
 | `prose` | MTP depth 1, no cut, 32k context | v0.2.1: prose 35.7 tok/s (T=0.6), greedy 37.6 | peak wired about 415 GiB at 78k (less at 32k) |
 | `code` | built-in MTP default (depth 2 + 0.7 cut), 32k | v0.2.1: code 41.7 tok/s, edit 42.7 | as `prose` |
 | `long` | bf16 cache, MTP depth 1, 393,216 context, load limit 488 | 375k-token needle found, first token 784 s, decode 20.3 tok/s | peak wired 442.6 GiB |
-| `1m` | 8-bit cache, no MTP head, 1,048,576 context, load limit 495 | 1.03M-token needle found, first token 58 min, decode 7.4 tok/s | peak wired 449.1 GiB |
-| `long-mtp` | 8-bit cache with MTP, expected about 850-900k | **being measured**, not available yet | - |
+| `1m` | 8-bit cache, MTP depth 1, 1,048,576 context, 1024-row prompt chunks, load limit 495 | 1.03M-token needle found, first token 63 min, decode 9.6 tok/s | peak wired 453.4 GiB |
+| `1m-nomtp` | 8-bit cache, no MTP head, 1,048,576 context, 2048-row chunks | 1.03M-token needle found, first token 58 min, decode 7.4 tok/s | peak wired 449.1 GiB |
 
 Safety:
 - The model wires 410-450 GiB of GPU memory. The script asks before running
@@ -261,8 +261,31 @@ with MTP depth 1; peak wired 442.6 GiB. Measured on tf42 (v0.2.1 plus the parall
 
 ## 1M context (8-bit KV cache)
 
-GLM-5.3's full 1,048,576-token window fits on a 512 GB M5 Ultra with the 8-bit KV cache and without the MTP head.
+GLM-5.3's full 1,048,576-token window fits on a 512 GB M5 Ultra with the 8-bit KV cache, with the MTP head on.
 The exact command of the measured run (paths replaced):
+
+```sh
+GLM_AX_K8=1 GLM_AX_PROMPT_ROWS=1024 GLM_AX_LOAD_LIMIT_GB=495 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off \
+  ./tensorfold-native serve /path/to/GLM-5.3-4bit-MTP \
+  --name glm53 --host 127.0.0.1 --port 8020 \
+  --context 1048576 --parallel 1 --reasoning-effort low --prompt-cache-gib 0 --no-update-check
+```
+
+`/path/to/GLM-5.3-4bit-MTP` is the merged 4-bit + MTP folder (see [Get the weights](#get-the-weights)).
+`./oneshot.sh --preset 1m` runs exactly this.
+
+Measured (v0.3.0 source, tf43), with and without the MTP head:
+
+| | `1m`: MTP depth 1, 1024-row prompt chunks | `1m-nomtp`: no MTP head, 2048-row prompt chunks |
+|---|---|---|
+| Prompt | 1,026,813 tokens, needle at 50% depth found ("The secret code is 4417-COBALT-29", plus an accurate description of the text) | the same prompt, needle found |
+| First token | 3,802 s (63 min) | 3,495 s (58.3 min, about 294 tok/s) |
+| Decode at 1M | **9.6 tok/s** (verify pass 172 ms, first-draft acceptance 118/174) | 7.4 tok/s (134.6 ms a step) |
+| After load | 394.8 GiB weights + 63.0 GiB caches | 389.6 GiB weights + 67.5 GiB caches |
+| Peak wired | 453.4 GiB | 449.1 GiB |
+| Compressor / lowest reclaimable | 0.11 GiB / 54.1 GiB (the memory guard never fired) | 0.49 GiB / about 50 GiB |
+
+The no-MTP variant (`./oneshot.sh --preset 1m-nomtp`) serves the plain 4-bit pack folder:
 
 ```sh
 GLM_AX_K8=1 GLM_AX_PROMPT_ROWS=2048 GLM_AX_LOAD_LIMIT_GB=495 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off \
@@ -271,29 +294,15 @@ GLM_AX_K8=1 GLM_AX_PROMPT_ROWS=2048 GLM_AX_LOAD_LIMIT_GB=495 GLM_AX_DRAFT_DEPTH=
   --context 1048576 --parallel 1 --reasoning-effort low --prompt-cache-gib 0 --no-drafts --no-update-check
 ```
 
-`/path/to/GLM-5.3-4bit` is the plain 4-bit pack folder (no MTP head); `--no-drafts` is required with it. The two
-`GLM_AX_DRAFT_DEPTH` / `GLM_AX_MTP_FLOOR` settings have no effect without drafts; they are kept because the run
-used them. `./oneshot.sh --preset 1m` runs exactly this.
-
-Measured (v0.3.0 source, tf43):
-
-| | |
-|---|---|
-| Prompt | 1,026,813 tokens, needle at 50% depth: found |
-| First token | 3,495 s (58.3 min, about 294 tok/s) |
-| Decode | 7.4 tok/s at 1M context (134.6 ms a step, no MTP head) |
-| Memory | after load 389.6 GiB weights + 67.5 GiB caches; peak wired 449.1 GiB; compressor 0.49 GiB; lowest reclaimable about 50 GiB; no swap growth |
+(`--no-drafts` is required with the plain pack; the two draft settings have no effect there and are kept because
+that run used them.)
 
 Requirements: a 512 GB Mac, the GPU wired limit raised (`sudo sysctl iogpu.wired_limit_mb=500000`, at your own
 risk), and nothing else large running.
 
-Why no MTP head at 1M: with the head loaded, the peak would be about 467 GiB and reclaimable memory would fall to
-about 44 GiB, under the 45 GiB line this project keeps free for macOS. With MTP, use up to 393k tokens on the bf16
-cache (above), or more on the 8-bit cache: a `long-mtp` setting (8-bit cache with MTP, expected about 850-900k
-tokens) is being measured and is not published yet.
-
-`GLM_AX_PROMPT_ROWS=2048` shrinks the prompt-time scratch (default 8192 rows) so the 1M prompt fits; it slows
-prompt processing a little.
+`GLM_AX_PROMPT_ROWS` shrinks the prompt-time scratch (default 8192 rows). With the MTP head, 1024-row chunks keep
+the 1M prompt inside memory; an earlier estimate that the head would not fit at 1M was too conservative, and it
+was measured above. Smaller chunks slow prompt processing somewhat (63 against 58 minutes here).
 
 ### 8-bit cache quality
 
@@ -430,10 +439,10 @@ The scripts use only the Python standard library.
 ## Limitations
 
 - One stream at a time by default (`--parallel 1`); multi-stream batching (`GLM_AX_BATCH=1`) is experimental.
-- Answers (needles) and memory were checked up to 1,026,813 tokens (8-bit cache, no MTP) and 375k (bf16, MTP);
-  decode speed was measured to 255k with MTP and at 1M without it (7.4 tok/s). Code decode at 256k was not run.
-  Decode slows with context (about 26 tok/s for prose at 128k, 21 at 256k, 7.4 at 1M without MTP).
-- The 1M setting has no MTP head (memory), and its first token takes about an hour.
+- Answers (needles) and memory were checked up to 1,026,813 tokens (8-bit cache, with and without MTP) and 375k
+  (bf16, MTP). Code decode at 256k and at 1M was not run. Decode slows with context (about 26 tok/s for prose at
+  128k, 21 at 256k, 9.6 at 1M with MTP, 7.4 without).
+- At 1M the first token takes about an hour.
 - Not bit-identical to MLX (summation order), see above.
 - The DFlash2 drafter path is in the code but not benchmarked for this README; the DSpark row comes from an
   earlier build (tf32).
