@@ -48,6 +48,11 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = why;
         return null;
     }
+    if (std.c.getenv("GLM_AX_TP_RANKS")) |v| if (!std.mem.eql(u8, std.mem.span(v), "1")) {
+        // tensor parallel runs only under the two-rank harness so far (tf-glm-ax-tp)
+        problem.* = "GLM_AX_TP_RANKS is set: the glm_ax engine serves one Mac; tensor parallel runs only in tf-glm-ax-tp for now (unset it)";
+        return null;
+    };
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const model = s5.Model.load(gpa, io, o.dir, .{ .mtp = o.drafts, .require_mtp = o.drafts }) catch |err| {
@@ -85,6 +90,11 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.metal = try s5.backend.Metal.init(gpa, model, .{ .capacity = want, .streams = @max(o.lanes, 1), .budget = budget });
     errdefer h.metal.deinit();
     try h.metal.warm();
+    {
+        const fullb = s5.state.cacheBytes(&model.config, want);
+        const r = s5.backend.Metal.reclaimableBytes();
+        std.log.info("glm_ax: allocation: a whole-context stream cache is {d:.1} GiB; reclaimable now {d:.1} GiB: streams get {s}", .{ @as(f64, @floatFromInt(fullb)) / (1 << 30), if (r) |x| @as(f64, @floatFromInt(x)) / (1 << 30) else -1.0, if (r) |x| (if (x >= fullb + (48 << 30)) "whole-context caches (live reuse in place)" else "prompt + reply caches (whole-context would leave under 48 GiB reclaimable)") else "prompt + reply caches" });
+    }
     h.drafter = null;
     h.wrap = null;
     if (std.c.getenv("GLM_AX_DFLASH2")) |dir| if (o.drafts) {
@@ -124,6 +134,10 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.core = lanes.Engine.init(gpa, &h.config, if (h.wrap) |*w| w.backend() else h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = @intCast(s5.state.prompt_rows), .decode_share = o.decode_share, .structures = true, .logprobs = true });
+    // shortest-remaining-first among prompt passes and replies (GLM-5.3-Flash's default on one Mac), now that the
+    // backend steps prompts a chunk a call (GLM_AX_STEPS); TENSORFOLD_PREFILL_ORDER still overrides
+    if (std.c.getenv("TENSORFOLD_PREFILL_ORDER") == null and o.decode_share == null and std.c.getenv("TENSORFOLD_PREFILL_SHARE") == null and h.host.share.p >= 1)
+        h.host.srpt = @TypeOf(h.host.srpt).withDefault(true);
     h.cache = null;
     h.cache_cap = if (o.prompt_cache_gib) |g| @intFromFloat(g * (1 << 30)) else budget;
     if (h.cache_cap > 0) {

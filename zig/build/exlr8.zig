@@ -84,6 +84,7 @@ pub fn glmTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         .{ "tf-glm-dsa-tp-check", "zig/tests/glm_dsa_tp_check.zig", "Two ranks of one GLM-5.3 layer on one Mac, summed, against the reference (MODEL_DIR REF_DIR)" },
         .{ "tf-glm-ax-kcheck", "zig/tests/glm_ax_kcheck.zig", "glm_ax attention kernels on synthetic keys: tensor-unit prompt kernel against the decode kernels, then its speed" },
         .{ "tf-glm-ax-drawcheck", "zig/tests/glm_ax_drawcheck.zig", "glm_ax bounded draw against the general row draw on synthetic rows, CPU only" },
+        .{ "tf-glm-ax-tp", "zig/tests/glm_ax_tp.zig", "GLM-5.3 on MLX affine weights, tensor parallel (the FFN split) over two ranks in one process through the fake pair (MODEL_DIR PROMPT)" },
         .{ "tf-glm-ax-run", "zig/tests/glm_ax_run.zig", "GLM-5.3 on MLX affine weights without the server: prompt chunks, a greedy reply, timings (MODEL_DIR PROMPT)" },
         .{ "tf-glm-dsa-run", "zig/tests/glm_dsa_run.zig", "GLM-5.3 on the pair without the server: a prompt's greedy reply (MODEL_DIR SETTINGS IDS_FILE)" },
         .{ "tf-glm-dsa-bench", "zig/tests/glm_dsa_bench.zig", "One rank's share of a GLM-5.3 layer timed piece by piece on the GPU (MODEL_DIR LAYER)" },

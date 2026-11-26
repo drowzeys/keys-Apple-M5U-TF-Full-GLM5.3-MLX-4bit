@@ -82,6 +82,65 @@ pub const Metal = struct {
     batched_rounds: usize = 0,
     batched_rows: usize = 0,
     taps: std.AutoHashMapUnmanaged(*st.Cache, mtl.Buffer) = .empty,
+    /// GLM_AX_LIVE_REUSE (on unless "0"): the last finished stream's caches, kept live (no copy) for a follow-up whose
+    /// prompt shares their prefix (the next turn of a conversation); any other request frees them first.
+    parked: ?Parked = null,
+    reused_rows: u64 = 0,
+
+    const Parked = struct {
+        cache: *st.Cache,
+        tokens: []u32, // the token of each cache row (the prompt, then the reply's committed tokens)
+        prompt_len: usize, // rows up to here came from prompt chunks on the grid (the rest from decode windows)
+    };
+
+    // the machine's reclaimable memory (free + inactive + speculative + purgeable pages), as the memory guard counts it
+    const VmStats = extern struct {
+        free_count: u32, active_count: u32, inactive_count: u32, wire_count: u32,
+        zero_fill_count: u64, reactivations: u64, pageins: u64, pageouts: u64, faults: u64, cow_faults: u64,
+        lookups: u64, hits: u64, purges: u64,
+        purgeable_count: u32, speculative_count: u32,
+        decompressions: u64, compressions: u64, swapins: u64, swapouts: u64,
+        compressor_page_count: u32, throttled_count: u32, external_page_count: u32, internal_page_count: u32,
+        total_uncompressed_pages_in_compressor: u64,
+    };
+    extern "c" fn mach_host_self() u32;
+    extern "c" fn host_statistics64(host: u32, flavor: c_int, info: *VmStats, count: *u32) c_int;
+    extern "c" var vm_page_size: usize;
+    pub fn reclaimableBytes() ?u64 {
+        var v: VmStats = undefined;
+        var n: u32 = @sizeOf(VmStats) / 4;
+        if (host_statistics64(mach_host_self(), 4, &v, &n) != 0) return null; // HOST_VM_INFO64
+        const pages: u64 = @as(u64, v.free_count) + v.inactive_count + v.speculative_count + v.purgeable_count;
+        return pages * vm_page_size;
+    }
+    /// A whole-context cache only when the machine keeps this much reclaimable after it (the guard's line is 45 GiB)
+    const full_margin: u64 = 48 << 30;
+
+    fn liveReuse() bool {
+        const v = std.c.getenv("GLM_AX_LIVE_REUSE") orelse return true;
+        return v[0] != '0';
+    }
+
+    fn freeParked(self: *Metal) void {
+        const pk = self.parked orelse return;
+        self.parked = null;
+        self.held -= st.cacheBytes(&self.model.config, pk.cache.capacity);
+        pk.cache.deinit();
+        self.gpa.destroy(pk.cache);
+        self.gpa.free(pk.tokens);
+        if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, null, &.{});
+    }
+
+    /// The parked caches' rows a new prompt can start from, or 0: its common prefix with their tokens, cut so each
+    /// kept row is bit-identical to a fresh prefill's (rows from whole prompt chunks on the grid, the row after the
+    /// last kept one's token matching for the MTP layer's entry, and at least one row left to feed).
+    fn parkedRows(pk: Parked, ids: []const u32) usize {
+        var lcp: usize = 0;
+        const n = @min(pk.tokens.len, ids.len);
+        while (lcp < n and pk.tokens[lcp] == ids[lcp]) lcp += 1;
+        const most = @min(lcp -| 1, @min(pk.prompt_len -| 1, ids.len - 1));
+        return sharedBoundary(most, pk.prompt_len, ids.len);
+    }
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
@@ -93,6 +152,7 @@ pub const Metal = struct {
     }
 
     pub fn deinit(self: *Metal) void {
+        self.freeParked();
         self.setResident(null);
         var it = self.caches.valueIterator();
         while (it.next()) |cache| {
@@ -137,6 +197,7 @@ pub const Metal = struct {
     }
 
     pub fn backend(self: *Metal) be.Backend {
+        if (stepsOn()) return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .reports_fill = true, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .held = heldFn, .prepare_features = prepareFn, .features = featuresFn, .probabilities = probabilitiesFn } };
         return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .held = heldFn, .prepare_features = prepareFn, .features = featuresFn, .probabilities = probabilitiesFn } };
     }
 
@@ -213,12 +274,50 @@ pub const Metal = struct {
     }
 
     /// Run `ids` at the cache's end, MTP absorbing rows with a known next; a stream's pass keeps at its marks.
+    /// GLM_AX_TAIL_ROWS (default 1024, 0: off): a prompt's last partial grid chunk goes in pieces of this many rows on
+    /// their own grid, so a follow-up whose prompt ends in the same grid chunk reuses its rows to within a piece and
+    /// still matches a fresh run's bits (both cut the same chunks); whole chunks keep the faster prompt_rows width.
+    fn tailRows() usize {
+        const v = std.c.getenv("GLM_AX_TAIL_ROWS") orelse return @min(1024, st.prompt_rows);
+        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return @min(1024, st.prompt_rows);
+        if (n == 0 or n >= st.prompt_rows or st.prompt_rows % n != 0 or n % 64 != 0) return st.prompt_rows;
+        return n;
+    }
+
+    /// Where the prompt chunk from absolute row `at` ends in a prompt of `total` rows: the grid chunk when the whole
+    /// chunk fits, else the next piece boundary of the tail.
+    /// GLM_AX_TAIL_FROM (default 65536): prompts shorter than this keep whole-width chunks throughout (a short
+    /// prompt's follow-up reuses a prompt-cache snapshot instead, and its first turn stays fastest)
+    fn tailFrom() usize {
+        const v = std.c.getenv("GLM_AX_TAIL_FROM") orelse return 65536;
+        return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 65536;
+    }
+
+    fn chunkEnd(at: usize, total: usize) usize {
+        const g = st.prompt_rows;
+        const whole = (at / g + 1) * g;
+        if (whole <= total or total < tailFrom()) return @min(whole, total);
+        const t = tailRows();
+        return @min(total, (at / t + 1) * t);
+    }
+
+    /// The last row boundary both chunkings share (a prompt of p1 rows and one of p2), at or below x.
+    fn sharedBoundary(x: usize, p1: usize, p2: usize) usize {
+        const g = st.prompt_rows;
+        const t1 = p1 / g * g;
+        const t2 = p2 / g * g;
+        if (x < t1) return x / g * g;
+        if (t1 == t2 and p1 >= tailFrom()) return x / tailRows() * tailRows();
+        return t1;
+    }
+
     fn feed(self: *Metal, cache: *st.Cache, ids: []const u32, stream: ?*lanes.Stream) !void {
         const c = &self.model.config;
         const base = cache.len;
+        const total = base + ids.len;
         var at: usize = 0;
         while (at < ids.len) {
-            var end = @min(ids.len, at + st.prompt_rows);
+            var end = chunkEnd(base + at, total) - base;
             if (stream) |sm| {
                 if (sm.isCancelled()) return error.Cancelled;
                 for (sm.chunks) |x| if (x > base + at and x < base + end) {
@@ -253,10 +352,110 @@ pub const Metal = struct {
 
     fn prefillFn(ptr: *anyopaque, stream: *lanes.Stream) !void {
         const self = cast(ptr);
+        const cache = try self.setupPrefill(stream);
+        errdefer self.dropStream(stream);
+        try self.feed(cache, stream.prompt()[cache.len..], stream);
+    }
+
+    /// A stream's caches freed after a failed prompt pass (not parked: its rows may be partial).
+    fn dropStream(self: *Metal, stream: *lanes.Stream) void {
+        const entry = self.caches.fetchRemove(stream) orelse return;
+        if (self.taps.fetchRemove(entry.value)) |e| e.value.deinit();
+        self.held -= st.cacheBytes(&self.model.config, entry.value.capacity);
+        entry.value.deinit();
+        self.gpa.destroy(entry.value);
+        if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, null, &.{});
+    }
+
+    /// GLM_AX_STEPS=1 (opt-in until measured): one prompt chunk a call, so the lane host runs decode rounds for the other
+    /// streams between them (--decode-share, SRPT); the first call sets the stream's caches up as prefillFn does.
+    fn prefillStepFn(ptr: *anyopaque, stream: *lanes.Stream, max_rows: u32) !bool {
+        const self = cast(ptr);
+        const cache = self.caches.get(stream) orelse try self.setupPrefill(stream);
+        const ids = stream.prompt();
+        if (stream.isCancelled()) {
+            stream.keepInterruptedPrefill(@intCast(cache.len));
+            return error.Cancelled;
+        }
+        if (cache.len >= ids.len) return true;
+        self.dropAhead();
+        const c = &self.model.config;
+        const at = cache.len;
+        // a cap keeps the chunk grid: the step ends at the next multiple of the cap's rows (bit-identical rows)
+        const step: usize = if (max_rows > 0) @min(st.prompt_rows, @max(64, @as(usize, max_rows) / 64 * 64)) else st.prompt_rows;
+        var end = if (max_rows > 0) @min(ids.len, (at / step + 1) * step) else chunkEnd(at, ids.len);
+        for (stream.chunks) |x| if (x > at and x < end) {
+            end = x;
+        };
+        for (stream.reuse.marks) |x| if (x > at and x < end) {
+            end = x;
+        };
+        const n = end - at;
+        const sc = if (n > st.window_rows) &self.prompt else &self.scratch;
+        try fwd.run(self.model, sc, cache, ids[at..end], .{ .hidden = .{ .buf = sc.hid }, .taps = self.tapsAt(cache, cache.len) });
+        cache.len += n;
+        const last: [*]const u8 = sc.hid.contents() + (n - 1) * c.hidden * 2;
+        @memcpy(cache.hidden.contents()[0 .. c.hidden * 2], last[0 .. c.hidden * 2]);
+        const known = if (end < ids.len) n else n - 1;
+        if (c.mtp > 0 and known > 0) try fwd.mtp(self.model, sc, cache, .{ .buf = sc.hid }, ids[at + 1 .. at + 1 + known], at);
+        lanes.prefill_widths.completed(self.gpa, stream, n);
+        stream.fill_at.store(@intCast(end), .release);
+        if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null) if (stream.reuse.hook) |k| k.at(k.ptr, stream, @intCast(end));
+        return end == ids.len;
+    }
+
+    fn stepsOn() bool { // opt-in until measured: GLM_AX_STEPS=1
+        const v = std.c.getenv("GLM_AX_STEPS") orelse return false;
+        return v[0] == '1';
+    }
+
+    /// A stream's caches for its prompt pass: the live-reuse adoption or a new cache (a kept snapshot restored), their
+    /// length the rows already filled.
+    fn setupPrefill(self: *Metal, stream: *lanes.Stream) !*st.Cache {
         self.dropAhead();
         const ids = stream.prompt();
         if (ids.len == 0 or ids.len + stream.max_new > self.options.capacity or self.caches.contains(stream)) return error.InvalidGlmPrompt;
-        const capacity = ids.len + stream.max_new + 1;
+        const need_cap = ids.len + stream.max_new + 1;
+        if (self.parked) |pk| {
+            const rows = parkedRows(pk, ids);
+            const snap_at: usize = if (stream.reuse.saved) |saved| @as(*const snapshot.Snap, @ptrCast(@alignCast(saved))).at else 0;
+            // a prompt that shares no usable prefix still takes the parked allocation when it fits (rows 0): no free and
+            // allocate of a whole-context cache between a long stream and a short request
+            const take = pk.cache.capacity >= need_cap and (rows > snap_at or (rows == 0 and snap_at == 0));
+            if (take) {
+                // the parked caches become this stream's, cut to the shared prefix: no copy, no prefill of it
+                self.parked = null;
+                self.gpa.free(pk.tokens);
+                const cache = pk.cache;
+                errdefer {
+                    self.held -= st.cacheBytes(&self.model.config, cache.capacity);
+                    cache.deinit();
+                    self.gpa.destroy(cache);
+                }
+                cache.len = rows;
+                cache.nheld = 0;
+                cache.chance = @splat(0);
+                cache.drafted = 0;
+                cache.accepted = 0;
+                cache.drafted_at = @splat(0);
+                cache.accepted_at = @splat(0);
+                cache.prof = .{};
+                try self.caches.put(self.gpa, stream, cache);
+                errdefer _ = self.caches.remove(stream);
+                stream.cached = @intCast(rows);
+                self.reused_rows += rows;
+                if (rows > 0) std.log.info("glm_ax: live reuse: {d} of {d} prompt rows from the last stream's caches (no copy)", .{ rows, ids.len });
+                if (self.room) |r| r.fit(r.ctx, self.options.budget - self.held, stream.reuse.saved, ids);
+                return cache;
+            }
+            self.freeParked();
+        }
+        // with live reuse, a stream's caches take the whole context when they fit: the next turn reuses them in place
+        const full = st.cacheBytes(&self.model.config, self.options.capacity);
+        const reclaim = reclaimableBytes();
+        const roomy = if (reclaim) |r| r >= full + full_margin else false;
+        const capacity = if (liveReuse() and !self.tapping and roomy and self.options.capacity >= need_cap and self.held + full <= self.options.budget) self.options.capacity else need_cap;
+        std.log.info("glm_ax: caches for this stream: {d} tokens ({s}), {d:.1} GiB; reclaimable before {d:.1} GiB", .{ capacity, if (capacity == self.options.capacity) "the whole context: a follow-up reuses them in place" else "prompt + reply: a whole-context cache would leave under 48 GiB reclaimable", gib(st.cacheBytes(&self.model.config, capacity)), if (reclaim) |r| gib(r) else -1.0 });
         const need = st.cacheBytes(&self.model.config, capacity);
         if (self.held + need > self.options.budget) {
             std.log.warn("glm_ax: a {d}-token stream needs {d:.1} GiB of caches; {d:.1} of {d:.1} GiB are held", .{ capacity, gib(need), gib(self.held), gib(self.options.budget) });
@@ -291,7 +490,7 @@ pub const Metal = struct {
                 if (snapshot.restore(self.model.queue, &self.model.config, snap, cache)) stream.cached = snap.at else |_| stream.reuse_failed = true;
             } else stream.reuse_failed = true;
         }
-        try self.feed(cache, ids[cache.len..], stream);
+        return cache;
     }
 
     /// A prompt chunk, a decode row, the MTP layers and the tower once: the first request skips the GPU's first touch.
@@ -641,6 +840,19 @@ pub const Metal = struct {
                 const sp = fwd.split;
                 if (sp.runs > 0) std.log.info("glm_ax: finish split over {d} passes, ms each: encode {d:.2}, commit+wait {d:.2}, GPU times read {d:.2}, failure check {d:.2}", .{ sp.runs, @as(f64, @floatFromInt(sp.encode)) / 1e6 / @as(f64, @floatFromInt(sp.runs)), @as(f64, @floatFromInt(sp.wait)) / 1e6 / @as(f64, @floatFromInt(sp.runs)), @as(f64, @floatFromInt(sp.times)) / 1e6 / @as(f64, @floatFromInt(sp.runs)), @as(f64, @floatFromInt(sp.failure)) / 1e6 / @as(f64, @floatFromInt(sp.runs)) });
                 fwd.split = .{};
+            }
+            if (liveReuse() and !self.tapping and cc.len > 0) park: {
+                // kept live for a follow-up: the token of each row (the prompt, then the reply's committed tokens)
+                const prompt = stream.prompt();
+                const out = stream.emitted();
+                if (cc.len > prompt.len + out.len) break :park;
+                const toks = self.gpa.alloc(u32, cc.len) catch break :park;
+                const from_prompt = @min(cc.len, prompt.len);
+                @memcpy(toks[0..from_prompt], prompt[0..from_prompt]);
+                @memcpy(toks[from_prompt..], out[0 .. cc.len - from_prompt]);
+                self.freeParked();
+                self.parked = .{ .cache = cc, .tokens = toks, .prompt_len = prompt.len };
+                return;
             }
             self.held -= st.cacheBytes(&self.model.config, entry.value.capacity);
             entry.value.deinit();

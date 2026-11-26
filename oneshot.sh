@@ -33,7 +33,9 @@ HOST=127.0.0.1
 
 PRESET=""
 DIR="${HOME}/glm53-tf"
-RELEASE="latest"
+DEFAULT_RELEASE="v0.3.1-glm53-reuse"
+DEFAULT_SHA="3f6a3aea32ad6cca81ea12229b4ebdd06d5769691b7a98afaf77056cb60d0624"
+RELEASE="$DEFAULT_RELEASE"
 DRY=0
 YES=0
 FORCE=0
@@ -47,7 +49,8 @@ Options:
   --preset NAME     prose | code | long | 1m | 1m-nomtp   (required for a run)
   --dir PATH        where the binary, logs, merged model folder and (if needed) the weights go
                     (default ~/glm53-tf)
-  --release TAG     release tag to fetch the binary from (default: the latest release)
+  --release TAG     release tag to fetch the binary from (default: v0.3.1-glm53-reuse, SHA-256 pinned here;
+                    "latest" takes the newest release and checks its published .sha256 only)
   --port N          server port (default 8020)
   --dry-run         print every step and command; download, write and start nothing
   --yes             answer yes to the wired-limit question (still runs sudo, which asks for your password)
@@ -97,14 +100,14 @@ preset_setup() {
       FLAGS="--context 32768 --parallel 1 --reasoning-effort low --no-update-check"
       MODEL_KIND=mtp
       NEED="about 420 GB free unified memory (peak wired about 415 GiB at 78k; less at 32k)"
-      MEASURED="v0.2.1 binary: prose 35.7 tok/s (T=0.6), greedy 37.6, code 39.3, edit 41.0; prefill about 736-786 tok/s"
+      MEASURED="v0.3.1: prose 36.2 tok/s (T=0.6), greedy 37.5, code 39.3, edit 40.9"
       ;;
     code)
       ENVS="GLM_AX_LOAD_LIMIT_GB=440"
       FLAGS="--context 32768 --parallel 1 --reasoning-effort low --no-update-check"
       MODEL_KIND=mtp
       NEED="about 420 GB free unified memory (peak wired about 415 GiB at 78k; less at 32k)"
-      MEASURED="v0.2.1 binary: code 41.7 tok/s, edit 42.7, prose 35.2 (T=0.6), greedy 36.7"
+      MEASURED="v0.3.1: code 41.8 tok/s, edit 42.7, prose 36.2 (T=0.6), greedy 36.8"
       ;;
     long)
       ENVS="GLM_AX_LOAD_LIMIT_GB=488 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off"
@@ -117,7 +120,7 @@ preset_setup() {
       ENVS="GLM_AX_K8=1 GLM_AX_PROMPT_ROWS=1024 GLM_AX_LOAD_LIMIT_GB=495 GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off"
       FLAGS="--context 1048576 --parallel 1 --reasoning-effort low --prompt-cache-gib 0 --no-update-check"
       MODEL_KIND=mtp
-      NEED="peak wired 453.4 GiB at a 1,026,813-token prompt (lowest reclaimable 54.1 GiB); nothing else large may run"
+      NEED="peak wired 453.4 GiB at a 1,026,813-token prompt; headroom is thin (lowest reclaimable 43-54 GiB across runs): close every other app"
       MEASURED="1,026,813-token needle found; first token 3,802 s (63 min); decode 9.6 tok/s with MTP depth 1"
       ;;
     1m-nomtp)
@@ -191,6 +194,9 @@ fetch_binary() {
   info "verifying SHA-256"
   if [ "$DRY" -eq 0 ]; then
     sha="$(awk '{print $1}' "${DIR}/${name}.tar.gz.sha256")"
+    if [ "$RELEASE" = "$DEFAULT_RELEASE" ] && [ "$sha" != "$DEFAULT_SHA" ]; then
+      die "the release's .sha256 ($sha) is not the one pinned in this script ($DEFAULT_SHA)"
+    fi
     echo "${sha}  ${DIR}/${name}.tar.gz" | shasum -a 256 -c - || die "SHA-256 mismatch for ${name}.tar.gz"
   else
     printf '   $ shasum -a 256 -c  (expected hash from %s.tar.gz.sha256)\n' "$name"

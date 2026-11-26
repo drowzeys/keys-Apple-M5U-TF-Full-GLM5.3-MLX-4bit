@@ -18,16 +18,18 @@ var k8_define: []const u8 = "";
 /// The GLM-5.3-Flash family's column-group products (core affine_mm's bits, faster): prompt experts and deep products.
 pub const mm_groups = @import("../glm/mm_groups.zig");
 const lanes = @import("lanes");
+const tp_pair = @import("tp.zig");
 
-pub const own_names = [_][:0]const u8{ "gx_norm", "gx_norm16", "gx_add", "gx_prep", "gx_qrope", "gx_attend", "gx_merge", "gx_index_key", "gx_index_scores", "gx_index_topk", "gx_index_qrope", "gx_swiglu", "gx_add_norm", "gx_moe_add_norm", "gx_heads_gemv", "gx_route_rows", "gx_moe_gu", "gx_moe_down", "gx_absorb", "gx_stream" };
-pub const Own = enum { norm, norm16, add, prep, qrope, attend, merge, index_key, index_scores, index_topk, index_qrope, swiglu, add_norm, moe_add_norm, heads_gemv, route_rows, moe_gu, moe_down, absorb, stream };
+pub const own_names = [_][:0]const u8{ "gx_norm", "gx_norm16", "gx_add", "gx_prep", "gx_qrope", "gx_attend", "gx_merge", "gx_index_key", "gx_index_scores", "gx_index_topk", "gx_index_qrope", "gx_swiglu", "gx_add_norm", "gx_moe_add_norm", "gx_heads_gemv", "gx_route_rows", "gx_moe_gu", "gx_moe_down", "gx_absorb", "gx_stream", "gx_tp_partial" };
+pub const Own = enum { norm, norm16, add, prep, qrope, attend, merge, index_key, index_scores, index_topk, index_qrope, swiglu, add_norm, moe_add_norm, heads_gemv, route_rows, moe_gu, moe_down, absorb, stream, tp_partial };
 pub const glue_names = [_][:0]const u8{ "s5_embed", "s5_swiglu", "s5_moe_add", "s5_sort", "s5_rows_by_order", "s5_copy32", "s5_widen" };
 pub const Glue = enum { embed, swiglu, moe_add, sort, rows_by_order, copy32, widen };
 
 /// What to load: the first `layers` main layers (null: all, with the head), the MTP layer, and at most `shards`
 /// main shard files in name order (null: every one the index names).
 /// `require_mtp`: drafts were asked for, so a checkpoint without the MTP head is refused rather than served undrafted.
-pub const Options = struct { layers: ?u32 = null, mtp: bool = true, shards: ?usize = null, require_mtp: bool = false };
+/// `tp_rank`: with GLM_AX_TP_RANKS=2, this model's rank (null: GLM_AX_TP_RANK); the one-process harness loads both.
+pub const Options = struct { layers: ?u32 = null, mtp: bool = true, shards: ?usize = null, require_mtp: bool = false, tp_rank: ?u32 = null };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -69,6 +71,14 @@ pub const Model = struct {
     window_costs: [16]lanes.config.Cost = undefined,
     window_costs_n: usize = 0,
     load_seconds: f64 = 0,
+    /// Tensor parallel (GLM_AX_TP_RANKS=2): this rank's FFN channels; `config`'s moe_inter and dense_inter are then
+    /// this rank's channel counts (the kernels' expert widths), the checkpoint's are in `full_moe_inter` and
+    /// `full_dense_inter`. Ranks 1: every channel, config as read.
+    tp: cfg.Tp = .{},
+    full_moe_inter: u32 = 0,
+    full_dense_inter: u32 = 0,
+    /// The exchange each FFN's partial goes through (tensor parallel only; set by whoever runs the ranks).
+    pair: ?*const tp_pair.Pair = null,
     /// The keepalive's queue when `queue` is Metal 4 (null: it shares `queue`).
     tick_queue: ?mtl.Queue = null,
 
@@ -108,8 +118,14 @@ pub const Model = struct {
         m.taps = 0;
         m.tap_at = @splat(-1);
         m.window_costs_n = 0;
+        m.pair = null;
         m.config = try cfg.read(gpa, io, dir);
         const c = &m.config;
+        m.full_moe_inter = c.moe_inter;
+        m.full_dense_inter = c.dense_inter;
+        m.tp = try cfg.tpFromEnv(c, o.tp_rank);
+        weights.tp_split = m.tp.on();
+        if (m.tp.on()) std.log.info("glm_ax: tensor parallel rank {d} of {d}: expert channels [{d}, {d}) of {d}, dense [{d}, {d}) of {d}; attention whole", .{ m.tp.rank, m.tp.ranks, m.tp.c0, m.tp.c1, c.moe_inter, m.tp.d0, m.tp.d1, c.dense_inter });
         m.device = try mtl.Device.init();
         errdefer m.device.deinit();
         // GLM_AX_METAL4=1: the queue through Metal 4 (command allocators, argument tables, a constants ring, stage
@@ -149,11 +165,19 @@ pub const Model = struct {
             return error.GlmMtpHeadMissing;
         }
         if (!mtp) c.mtp = 0;
-        m.weights = try weights.load(gpa, m.device, &m.checkpoint, c, o.layers orelse c.layers, mtp);
+        m.weights = try weights.load(gpa, m.device, &m.checkpoint, c, m.tp, o.layers orelse c.layers, mtp);
         errdefer m.weights.deinit(gpa);
         m.checkpoint.closeFiles();
+        // tensor parallel: from here the config's expert and dense widths are this rank's (scratch, kernels, grids)
+        if (m.tp.on()) {
+            c.moe_inter = m.tp.moeLocal();
+            c.dense_inter = m.tp.denseLocal();
+        }
+        // the MoE kernels' expert width (glm_ax.metal's MI, glm_ax_moe.metal's GXI): 2048 unless split
+        var mi_buf: [64]u8 = undefined;
+        const mi_define: []const u8 = if (m.tp.on()) try std.fmt.bufPrint(&mi_buf, "#define GX_MI {d}\n", .{c.moe_inter}) else "";
         {
-            const src = try std.mem.concat(gpa, u8, &.{ k8_define, ks.glm_ax });
+            const src = try std.mem.concat(gpa, u8, &.{ k8_define, mi_define, ks.glm_ax });
             defer gpa.free(src);
             const lib = try mtl.Library.fromSource(m.device, src, mtl.CompileOptions.mlx());
             defer lib.deinit();
@@ -263,7 +287,7 @@ pub const Model = struct {
         }
         errdefer for (m.gemm) |p| p.deinit();
         {
-            const text = try std.mem.concat(gpa, u8, &.{ ks.core_row_projection, ks.glm_ax_moe });
+            const text = try std.mem.concat(gpa, u8, &.{ mi_define, ks.core_row_projection, ks.glm_ax_moe });
             defer gpa.free(text);
             const lib = try mtl.Library.fromSource(m.device, text, mtl.CompileOptions.mlx());
             defer lib.deinit();

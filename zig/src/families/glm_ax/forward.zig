@@ -90,6 +90,8 @@ const Enc = struct {
     /// The encoder is concurrent: a dispatch waits for every earlier one (a barrier) unless `join` is set, which
     /// lets the next dispatch run beside the last (it reads and writes nothing the last writes).
     join: *bool,
+    /// GPU seconds of the command buffers ended before the current one (tensor parallel's exchanges).
+    before: f64 = 0,
 
     fn on(x: *const Enc) bool {
         if (x.only) |o| if (o != x.cur) return false;
@@ -117,6 +119,44 @@ const Enc = struct {
         p.gpu[@intFromEnum(x.cur)] += x.cb.gpuSeconds();
         x.cb = x.m.queue.commandBuffer();
         x.e = x.cb.compute(.concurrent);
+    }
+
+    /// Tensor parallel: the exchange point after an FFN. The encoder ends and its command buffer runs; this rank's
+    /// fp32 partial (m.pair's part, `n` rows, written by gx_tp_partial) goes to the pair, which sums the ranks'
+    /// partials into it in rank order; the sum is added into the fp32 residual here (both ranks alike), and a new
+    /// command buffer continues.
+    fn exchange(x: *Enc, n: usize) !void {
+        const p = x.m.pair orelse return error.GlmTpNeedsPair;
+        x.e.end();
+        x.cb.commit();
+        x.cb.wait();
+        if (x.cb.failure()) |msg| {
+            std.log.err("glm_ax forward ({s}, before an exchange): {s}", .{ @tagName(x.cur), msg });
+            p.abort();
+            return error.GpuFailed;
+        }
+        const gpu = x.cb.gpuSeconds();
+        x.before += gpu;
+        if (x.prof) |pr| pr.gpu[@intFromEnum(x.cur)] += gpu;
+        const h: usize = x.m.config.hidden;
+        const part = p.part.slice(f32, n * h);
+        try p.exchange(part);
+        for (x.s.resid.slice(f32, n * h), part) |*r, v| r.* += v;
+        x.cb = x.m.queue.commandBuffer();
+        x.e = x.cb.compute(.concurrent);
+        x.join.* = false;
+    }
+
+    /// Tensor parallel: this rank's FFN partial into the pair's buffer (fp32: the routed picks weighted by the
+    /// router, `picks` of them a row, plus `shared`; a dense layer: picks 0, its MLP's rows in `shared`), the
+    /// exchange, then the next layer's input norm of the summed residual into s.x (none after the last layer).
+    fn tpCombine(x: *Enc, n: usize, picks: u32, shared: mtl.Buffer, next: ?wts.Tensor) !void {
+        const p = x.m.pair orelse return error.GlmTpNeedsPair;
+        const s = x.s;
+        const c = &x.m.config;
+        x.own(.tp_partial, .{ .rows = @intCast(n), .width = c.hidden, .heads = picks }, &.{ b(p.part), b(s.ey), b(s.wts), b(shared), A }, .{ c.hidden, n, 1 }, .{ 256, 1, 1 }, false);
+        try x.exchange(n);
+        if (next) |w| x.norm(b(s.resid), w, b(s.x), n, 0, 0);
     }
 
     fn bindAll(x: Enc, args: anytype, bufs: []const B) void {
@@ -378,6 +418,12 @@ fn runSegs(m: *const Model, s: *st.Scratch, segs: []const Seg, ids: []const u32,
         total += g.n;
     }
     if (total != n) return error.InvalidGlmBatch;
+    if (m.tp.on()) {
+        // tensor parallel: every FFN ends at an exchange (no step encoded ahead; the pair's buffer holds the rows)
+        const p = m.pair orelse return error.GlmTpNeedsPair;
+        if (out.pending != null) return error.UnsupportedGlmTp;
+        if (n > p.rows or p.part.length() < n * c.hidden * 4) return error.GlmRowsExceeded;
+    }
     for (ids) |id| if (id >= c.vocab) return error.InvalidGlmToken;
     if (out.pending == null) @memcpy(s.ids.slice(u32, n), ids);
     if (segs.len == 1) rowTable(s, c, start, n) else {
@@ -434,7 +480,7 @@ fn runSegs(m: *const Model, s: *st.Scratch, segs: []const Seg, ids: []const u32,
         return;
     }
     try finish(x);
-    if (out.gpu) |g| g.* += x.cb.gpuSeconds();
+    if (out.gpu) |g| g.* += x.before + x.cb.gpuSeconds();
     if (out.profile) |p| p.runs += 1;
 }
 
@@ -446,6 +492,10 @@ pub fn mtp(m: *const Model, s: *st.Scratch, cache: *st.Cache, hidden: B, tokens:
     const head = m.weights.mtp orelse return error.GlmHasNoMtp;
     if (n == 0 or n > s.rows) return error.GlmRowsExceeded;
     if (start + n > cache.capacity) return error.GlmContextFull;
+    if (m.tp.on()) {
+        const p = m.pair orelse return error.GlmTpNeedsPair;
+        if (n > p.rows or p.part.length() < n * c.hidden * 4) return error.GlmRowsExceeded;
+    }
     @memcpy(s.ids.slice(u32, n), tokens);
     rowTable(s, c, start, n);
     const h: usize = c.hidden;
@@ -495,7 +545,7 @@ fn finish(x: Enc) !void {
     x.cb.commit();
     x.cb.wait();
     const t1 = nowNs();
-    x.s.last_gpu = x.cb.gpuSeconds();
+    x.s.last_gpu = x.before + x.cb.gpuSeconds();
     const t2 = nowNs();
     defer {
         const t3 = nowNs();
@@ -529,7 +579,7 @@ fn layer(x: *Enc, segs: []const Seg, l: wts.Layer, i: usize, n: usize, normed: b
         .dense => |d| {
             try x.mark(.dense);
             try mlp(x.*, d, s, s.y, n, c.dense_inter);
-            if (next) |w| x.own(.add_norm, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.resid), b(s.y), t(w), A, b(s.x) }, .{ n, 1, 1 }, .{ norm_threads, 1, 1 }, true) else x.add(s.y, n);
+            if (m.tp.on()) try x.tpCombine(n, 0, s.y, next) else if (next) |w| x.own(.add_norm, .{ .rows = nr, .width = c.hidden, .eps = c.eps }, &.{ b(s.resid), b(s.y), t(w), A, b(s.x) }, .{ n, 1, 1 }, .{ norm_threads, 1, 1 }, true) else x.add(s.y, n);
         },
         .moe => |e| {
             try x.mark(.route);
@@ -551,7 +601,9 @@ fn layer(x: *Enc, segs: []const Seg, l: wts.Layer, i: usize, n: usize, normed: b
                 x.own(.route_rows, .{ .width = c.experts, .heads = c.topk, .scale = c.routed_scale }, &.{ b(s.logits16), b(e.bias), A, b(s.pick), b(s.wts) }, .{ n, 1, 1 }, .{ c.experts, 1, 1 }, true);
             }
             // GLM_AX_MOE_FUSED=1, decode: the nine experts' gate/up/SwiGLU in one launch and their down in another
-            const fused = n <= st.window_rows and std.c.getenv("GLM_AX_MOE_FUSED") != null;
+            // (its kernels read an expert's channels 512 at a time: a tensor-parallel share that is no multiple of 512
+            // takes the unfused path)
+            const fused = n <= st.window_rows and std.c.getenv("GLM_AX_MOE_FUSED") != null and c.moe_inter % 512 == 0;
             // decode with no stage filter: the shared expert's three launches run beside the routed path's
             const interleave = n <= st.window_rows and x.only == null and !fused;
             // GLM_AX_SKIP_SHARED=1 (timing only, wrong output): no shared expert, its marginal cost in a whole step
@@ -654,7 +706,9 @@ fn layer(x: *Enc, segs: []const Seg, l: wts.Layer, i: usize, n: usize, normed: b
             try x.mark(.shared);
             if (!interleave and !fused) try mlp(x.*, e.shared, s, s.shared, n, c.moe_inter);
             try x.mark(.moe_add);
-            if (next) |w| {
+            if (m.tp.on()) {
+                try x.tpCombine(n, c.topk, s.shared, next);
+            } else if (next) |w| {
                 x.own(.moe_add_norm, .{ .rows = nr, .width = c.hidden, .heads = c.topk, .eps = c.eps }, &.{ b(s.resid), b(s.ey), b(s.wts), b(s.shared), t(w), A, b(s.x) }, .{ n, 1, 1 }, .{ norm_threads, 1, 1 }, true);
             } else x.glue(.moe_add, Args{ .rows = nr, .width = c.hidden, .heads = c.topk }, &.{ b(s.resid), b(s.ey), b(s.wts), b(s.shared), A }, .{ h, n, 1 }, .{ 256, 1, 1 }, false);
         },

@@ -6,6 +6,7 @@ unchanged. Upstream's history is not included: each release of this repository i
 
 | Release here | Upstream base | glm_ax build |
 |---|---|---|
+| v0.3.1-glm53-reuse | v1.3.5 (`02b324ae`) | tf48: live prompt reuse, hybrid prompt chunks, parked-allocation reuse, 48 GiB whole-context rule; experimental two-rank tensor-parallel harness |
 | v0.3.0-glm53-1m | v1.3.5 (`02b324ae`) | tf43: `max_context` 1,048,576; 8-bit KV cache (`GLM_AX_K8`); `GLM_AX_PROMPT_ROWS`; exact parallel-scan top-k; experimental `GLM_AX_BATCH` / `GLM_AX_DUAL`; untested `GLM_AX_DECODE_NAX` |
 | v0.2.1-glm53-prefill | v1.3.5 (`02b324ae`) | tf39: 8192-row prompt chunks, fused gate/up/SwiGLU prompt experts; MTP default depth 2 + cut 0.7 |
 | v0.2.0-glm53-prefill | v1.3.5 (`02b324ae`) | tf33: prefill changes, DFlash2/DSpark/confidence cut opt-in |
@@ -85,3 +86,19 @@ no upstream file changed since v0.2.0.
 | `README.md` -> `README-TensorFold.md` | upstream's README, unchanged, under a new name |
 | `zig/build/release_version.zig`, `.github/workflows/app.yml` | point at `README-TensorFold.md` instead of `README.md` |
 | `NOTICE` | a section at the top describing this copy and its credits |
+
+## v0.3.1 (glm_ax)
+
+- Live reuse: a finished stream's caches stay allocated for a follow-up whose prompt shares their prefix (the next turn
+  of a conversation), with no copy; the prompt pass starts at the shared prefix. GLM_AX_LIVE_REUSE=0 turns it off.
+- Hybrid prompt chunks: prompts of 65,536 tokens or more run in 8192-row chunks, the last partial chunk in 1024-row
+  pieces (GLM_AX_TAIL_ROWS, GLM_AX_TAIL_FROM), identically on every run, so a follow-up reuses its prefix to within a
+  piece and stays bit-identical to the same prompt run fresh.
+- A short request after a long stream takes over the kept allocation instead of freeing and allocating a cache.
+- A stream gets a whole-context cache only when the machine keeps 48 GiB reclaimable after it; otherwise prompt +
+  reply. The choice is logged at startup and for each stream.
+- Opt-in, not yet measured: GLM_AX_STEPS=1 (one prompt chunk per call, with shortest-remaining-first ordering).
+- Experimental, not used by the server presets: `glm_ax/tp.zig` and `tests/glm_ax_tp.zig` (`tf-glm-ax-tp` build
+  step, registered in `zig/build/exlr8.zig`): a tensor-parallel milestone that splits the FFN over two ranks in one
+  process through an in-process pair (`GLM_AX_TP_RANKS=2`), checking both ranks hold the same bits.
+- tf48 against tf43 changes only glm_ax files and `zig/build/exlr8.zig` (the new build step); no third-party code.

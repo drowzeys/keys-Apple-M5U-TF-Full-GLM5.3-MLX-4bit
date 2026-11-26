@@ -304,6 +304,19 @@ kernel void gx_route_rows(const device bfloat* L [[buffer(0)]], const device flo
   }
 }
 
+// Tensor parallel: this rank's FFN partial in fp32, P[r][i] = sum_k wts[r, k] Y[r, k][i] (the picks in pick order,
+// a.heads of them; 0 for a dense layer) + float(S[r][i]) (the shared expert's or the dense MLP's bf16 rows), unrounded.
+kernel void gx_tp_partial(device float* P [[buffer(0)]], const device bfloat* Y [[buffer(1)]],
+                          const device float* wts [[buffer(2)]], const device bfloat* S [[buffer(3)]],
+                          constant gx_args& a [[buffer(4)]], uint2 p [[thread_position_in_grid]]) {
+  if (p.x >= a.width || p.y >= a.rows) return;
+  const ulong r = p.y;
+  const uint k = a.heads;
+  float sum = 0.0f;
+  for (uint j = 0; j < k; ++j) sum += wts[r * k + j] * float(Y[(r * k + j) * a.width + p.x]);
+  P[r * a.width + p.x] = sum + float(S[r * a.width + p.x]);
+}
+
 // R[r] += float(X[r]): a sublayer's bf16 rows into the fp32 residual.
 kernel void gx_add(device float* R [[buffer(0)]], const device bfloat* X [[buffer(1)]],
                    constant gx_args& a [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
@@ -644,7 +657,11 @@ kernel void gx_index_topk(const device float* score [[buffer(0)]], device gx_row
 // Decode MoE for 1-4 rows, all nine experts of a row (its eight picks and the shared one) per launch.
 // MLX affine 4-bit, groups of 64, K = 6144 inputs for gate/up, 2048 for down; weights read in 16-byte loads.
 
-constant constexpr uint MK = 6144, MI = 2048, MG = MK / 64, MW = MK / 32; // MW: uint4 loads a gate/up row
+// GX_MI: an expert's intermediate channels (tensor parallel builds define this rank's share; 2048 otherwise)
+#ifndef GX_MI
+#define GX_MI 2048
+#endif
+constant constexpr uint MK = 6144, MI = GX_MI, MG = MK / 64, MW = MK / 32; // MW: uint4 loads a gate/up row
 constant constexpr uint MOE_SG = 8; // simdgroups a threadgroup, one output each
 
 struct gx_moe_args {

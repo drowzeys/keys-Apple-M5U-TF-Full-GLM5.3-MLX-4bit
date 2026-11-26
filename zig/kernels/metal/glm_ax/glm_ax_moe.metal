@@ -4,7 +4,11 @@
 // each simdgroup takes 4 output rows with the input read 16 values a lane, 512 at a time, exactly as the core's
 // row kernels do, so every value is the unfused path's (bit for bit), in two launches for a row's nine experts
 // (its eight picks, then the shared one) instead of seven. MLX affine 4-bit, groups of 64.
-constant constexpr int GXH = 6144, GXI = 2048, GXGS = 64;
+// GX_MI: an expert's intermediate channels (tensor parallel builds define this rank's share; 2048 otherwise)
+#ifndef GX_MI
+#define GX_MI 2048
+#endif
+constant constexpr int GXH = 6144, GXI = GX_MI, GXGS = 64;
 
 struct gx_moe_rows_args {
   uint rows, topk, slots, pad0; // slots = topk + 1 a row
