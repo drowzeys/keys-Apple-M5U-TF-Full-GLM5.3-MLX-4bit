@@ -18,6 +18,9 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
   needle was found in a 1,026,813-token prompt, decode 9.6 tok/s. With the bf16 cache, up to 393,216 tokens.
 - One stream at a time (`--parallel 1`) by default.
 
+**Two ways to run it:** one 512 GB Mac → [`oneshot.sh`](#one-shot) (TensorFold); two 256 GB Macs →
+[`tp2/oneshot-tp2.sh`](#two-256-gb-macs-tp2) (MLX, tensor parallel over Thunderbolt 5).
+
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
 
@@ -57,6 +60,90 @@ Safety:
 - The binary is ad-hoc signed, not notarized; the script clears the download quarantine flag
   (`xattr -dr com.apple.quarantine`) on the unpacked folder only.
 - The script uses no sudo except that one optional step.
+
+## Two 256 GB Macs (TP=2)
+
+Instead of one 512 GB Mac, GLM-5.3 can run on **two 256 GB M5 Ultra Macs** joined by Thunderbolt 5 cables, split
+tensor-parallel (TP=2) on [MLX](https://github.com/ml-explore/mlx): each Mac holds half of every layer (half the
+attention heads and half of every expert's columns, ~198 GiB), the two halves are summed after each attention and
+MoE block with MLX's `jaccl` RDMA backend striped over every Thunderbolt link. The model code is
+[oMLX](https://github.com/jundot/omlx)'s GLM-5.3 implementation; this is a separate engine from the TensorFold
+recipe above.
+
+```sh
+# on the first Mac (it serves HTTP and drives the second Mac over ssh); oneshot-tp2.sh is a release asset
+# (also in tp2/ of this repository)
+./oneshot-tp2.sh --peer USER@SECOND_MAC --dry-run     # print every step, change nothing
+./oneshot-tp2.sh --peer USER@SECOND_MAC               # check, install, download, pre-shard, start, smoke test
+./oneshot-tp2.sh --peer USER@SECOND_MAC --status      # / --stop
+```
+
+The script checks both Macs (macOS 26.2 or later on both, at least 256 GB, RDMA enabled; it refuses older macOS), finds the Thunderbolt RDMA links and
+writes the hostfile, installs the release bundle `keys-glm53-tp2-macos-arm64-<ver>.tar.gz` (CPython 3.11.14 and every
+pinned wheel, offline, identical on both Macs; SHA-256 pinned in the script), downloads the pinned weights on the
+first Mac, writes rank 1's half and moves it to the second Mac file by file over Thunderbolt, then starts both ranks
+with `MLX_METAL_FAST_SYNCH=1` and waits for a "Canberra" answer. Server: OpenAI-compatible
+`http://127.0.0.1:8000/v1` (`/chat/completions`, `/completions`, streaming), one request at a time, prefix reuse
+between requests.
+
+Before you start:
+- **RDMA over Thunderbolt** must be enabled on both Macs, and that is only possible from macOS Recovery (Terminal:
+  `rdma_ctl enable`, then restart). The script never uses sudo.
+- Password-less ssh from the first Mac to the second, and to itself (`mlx.launch` starts rank 0 over ssh too):
+  System Settings > General > Sharing > Remote Login.
+- macOS asks whether Python may find devices on the local network: allow it on both Macs.
+- **Memory**: quit other GPU and memory-heavy apps on both Macs. Measured with nothing else running, the second Mac
+  keeps ~42 GiB reclaimable after loading its half; long contexts and many streams use that up.
+- Disk: ~420 GB on the first Mac (weights), ~215 GB on the second (its half).
+
+### Measured (2026-11-26, two M5 Ultra Macs, four Thunderbolt 5 cables)
+
+Even split (experts 0.5/0.5, 32/32 heads), greedy, 1k-token prompts for decode. "One Mac" is the same MLX code on
+one 512 GB Mac (not TensorFold).
+
+| | Two 256 GB Macs (TP=2) | One Mac, same code |
+|---|---|---|
+| One stream, plain | 34.5 tok/s | 26.9 |
+| One stream, MTP depth 1: prose / code | 38.0 / 45.5 tok/s (acceptance 0.65 / 0.85) | 29.6 / 31.7 |
+| 4 / 8 / 16 / 32 streams (total) | 76.0 / 105.1 / 119.3 / 152.1 tok/s | 43.9 / 66.6 / 77.5 / 101.2 |
+| Prompt processing at 4k / 32k tokens | 968 / 961 tok/s | 736 / 700 |
+| 128k context, one stream (8-bit KV cache) | prefill 625 tok/s, decode 25.9 tok/s | prefill 503, decode 21.5 (bf16 cache) |
+| 256k context, one stream (8-bit KV cache) | prefill 530 tok/s, decode 22.1 tok/s | |
+
+The stream counts above were measured with the benchmark harness (batched decode); the server itself runs one
+request at a time.
+
+### Method and exactness
+
+- Each layer's attention heads and expert columns are split between the Macs; two all_sums per layer (156 per token)
+  cost 2-4 ms per token over four links. Without `MLX_METAL_FAST_SYNCH=1` each one costs ~0.25 ms (39 ms per
+  token): that setting is required (finding credited to [machd](https://github.com/machddev/machd)).
+- Logits against one Mac (4 layers): max difference 0.047 (bf16 rounding of the summed halves), same top-10.
+- Plain server (no `--mtp`): its greedy tokens equal the development runner's at the same settings, 128/128,
+  tested from a clean install of the release bundle on both Macs.
+- **MTP output is not bit-identical to plain greedy on TP=2** (unlike the one-Mac TensorFold build). A draft is
+  kept only when it equals the verify pass's argmax, but the 2-row verify pass runs a different kernel path than
+  1-row decode, so about 2-6 % of positions flip at near-ties (largest logit gap 0.5). Teacher-forced along plain
+  greedy's own text, verify agrees with 1-row decode at 157/160 positions on code and 150/160 on prose; no
+  disagreement is tied to a rejected draft's rollback (2 of 13 fall on rollback cycles, all within the same
+  rounding gap). For exact greedy output, start the server without `--mtp` (`--no-mtp` in the one-shot).
+- 8-bit latent KV cache (`--kv8`, 57.7 instead of 95.2 KB per token): at 32k, top-1 agreement along the bf16 text
+  97/97; at 1k 92/97, every miss within 0.25 logits (a rounding tie). Decode 2-7 % slower.
+
+### Known limits
+
+- One request at a time in the server; MTP only for greedy requests (sampled requests decode plainly).
+- The server reuses the cached prefix of the previous request. A repeated greedy request then runs a shorter
+  prefill than the first one did, and its answer can differ from the first ("cold") answer at near-ties;
+  requests made in the same cache state give identical answers.
+- Chat answers put GLM's thinking in `reasoning_content` and the reply in `content` (also when streaming).
+- KV cache is held in full on both Macs (not split), so context × streams is bounded by the second Mac's ~42 GiB:
+  about 300k tokens in total with the bf16 cache, ~1.65x that with `--kv8`.
+- Both Macs must be the same macOS/Python setup (the bundle takes care of Python) and stay cabled; if one rank
+  exits, restart both (`--stop`, then run again).
+- Rank 0's control port (5470, rank 1 connects to it) listens on all network interfaces and has no
+  authentication: run it on a trusted network or block that port in the firewall for anything but the
+  Thunderbolt link.
 
 ## Releases
 
@@ -606,4 +693,12 @@ The scripts use only the Python standard library.
 - Multi-token prediction: Gloeckle et al., "Better & Faster Large Language Models via Multi-token Prediction"
   (2024), and the MTP module design of DeepSeek-V3 (2024) that GLM-5.3's MTP layer follows; speculative decoding:
   Leviathan et al. (2023) and Chen et al. (2023).
+- Two-Mac TP=2 recipe (`tp2/`): [MLX](https://github.com/ml-explore/mlx) and mlx-lm (MIT; `mx.distributed` with
+  the `jaccl` Thunderbolt RDMA backend), [oMLX](https://github.com/jundot/omlx) 0.8.0rc1 (Apache-2.0; its GLM-5.3
+  model code, installed as a dependency, and the sources the 8-bit cache, the prefill kernel and the two
+  run-time-length helper kernels in `tp2/glm_tp/lc/` are derived from; Copyright 2026 Apple Inc. on that kernel
+  file),
+  [machd](https://github.com/machddev/machd) (MIT; the `MLX_METAL_FAST_SYNCH=1` finding, no code), CPython via
+  python-build-standalone, tensor parallelism after Megatron-LM (Shoeybi et al., 2019). The release bundle carries
+  every component's licence (`THIRD_PARTY_NOTICES.md`, `LICENSES/components/`).
 - The `merge_mtp_head.py` key names follow the `mtp.*` layout that oMLX's GLM loader also uses.

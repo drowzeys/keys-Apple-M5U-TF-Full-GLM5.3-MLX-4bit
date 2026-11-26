@@ -1,0 +1,29 @@
+GLM-5.3 on two 256 GB Apple M5 Ultra Macs (tensor parallel, TP=2) - release bundle
+
+This bundle holds the TP=2 server and tools, CPython 3.11.14 and every Python wheel they need (exact pinned
+versions, macOS arm64), so both Macs get the same, offline install. No model weights are included.
+
+Easiest: download oneshot-tp2.sh from the same release (it pins this bundle's SHA-256) and run it on the first
+Mac:
+
+    ./oneshot-tp2.sh --peer USER@SECOND_MAC --dry-run     # downloads and checks this bundle itself
+    ./oneshot-tp2.sh --peer USER@SECOND_MAC               # or --bundle THIS_FILE.tar.gz
+
+Requirements: two Macs with an M5-class GPU and at least 256 GB of memory each, macOS 26.2 or later on both Macs (RDMA over Thunderbolt and the bundled
+MLX build for macOS 26 need it; the one-shot refuses older systems), RDMA over
+Thunderbolt enabled on both (from macOS Recovery: Terminal, `rdma_ctl enable`), one or more Thunderbolt 5 cables
+between them (all are used), password-less ssh from the first Mac to the second and to itself, ~420 GB of free
+disk on the first Mac and ~215 GB on the second.
+
+By hand, on each Mac (the same folder on both, e.g. /Users/Shared/glm53-tp2):
+
+    mkdir -p DIR/app && tar -xzf THIS_FILE.tar.gz -C DIR/app --strip-components 1
+    bash DIR/app/install.sh DIR          # creates DIR/venv from the wheels, offline
+
+then on the first Mac download the weights, pre-shard rank 1 to the second Mac and start (see oneshot-tp2.sh in the release
+for the exact commands: hf download, tools/merge_mtp_head.py, tp2/preshard.py, mlx.launch ... tp2/server.py).
+
+Server: OpenAI-compatible on the first Mac, http://127.0.0.1:8000/v1 (/chat/completions, /completions,
+/models; "stream": true for server-sent events). Smoke test: DIR/venv/bin/python DIR/app/tp2/smoke.py
+
+Licences: LICENSE, NOTICE, THIRD_PARTY_NOTICES.md, LICENSES/ (every bundled component's own licence files).
