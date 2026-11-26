@@ -483,7 +483,7 @@ curl -s 127.0.0.1:8020/v1/chat/completions -H 'Content-Type: application/json' \
 | `GLM_AX_LOAD_LIMIT_GB` | load limit in GB (default 75% of RAM); 440 for the 32k benchmarks, 470 for 256k, 488 for 393k (bf16), 495 for 1M (8-bit) |
 | `GLM_AX_K8` | `1`: 8-bit latent and index caches (49.8 KB a token instead of 96.6 KB); `lat` or `idx`: only one of them; unset: bf16 |
 | `GLM_AX_PROMPT_ROWS` | prompt chunk rows, 1024-8192 in steps of 64 (default 8192); smaller means less prompt scratch memory (2048 for 1M) |
-| `GLM_AX_BATCH=1` | **experimental**: batched verify across streams for `--parallel` > 1 (measured +24% total throughput at 4 streams on the bf16 cache; greedy output under load equal to running alone 4/4; still being measured) |
+| `GLM_AX_BATCH=1` | **experimental**: batched verify across streams for `--parallel` > 1 (+30-39% total throughput at 4 streams in the [concurrency sweep](#concurrency-and-context-sweep); greedy output under load equal to running alone in every batched run) |
 | `GLM_AX_DUAL=1` | **experimental**, with `GLM_AX_DSPARK`: each stream's rounds use DSpark or the MTP head, whichever measures faster; exact, but slower than MTP alone on prose |
 | `GLM_AX_DECODE_NAX=1` | **untested, do not use**: tensor-unit attention for decode rows |
 | `GLM_AX_DRAFT_DEPTH` | MTP drafts a window holds, 1-3 (default 2 since v0.2.1); 1 is best for prose |
