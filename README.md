@@ -170,6 +170,82 @@ Earlier:
 
 The output is not bit-identical to MLX: the kernels sum in a different order (fp32 sums of exact bf16 products).
 
+## Concurrency and context sweep
+
+### Method
+
+v0.3.0 build (tf43) on the MTP model folder, built-in MTP default (depth 2 + 0.7 cut), `GLM_AX_LOAD_LIMIT_GB=475`,
+`--parallel 4 --prompt-cache-gib 0`, `--context` = the per-stream context shown, `GLM_AX_K8=1` for the 8-bit rows
+and `GLM_AX_BATCH=1` (batched verify) or `0`. Each stream gets a fresh prompt of "notes" prose and a greedy answer
+(1,200 new tokens at 32k, 3,000 at 90k, 3,500 at 128k). Decode rates are measured only in the window where all
+streams decode at once. The prompts are prefilled one after another, so a later stream's first token includes the
+earlier streams' prompts. Each stream was then also run alone; "greedy = alone" means the greedy output under load
+was byte-identical to the same prompt alone. `GLM_AX_BATCH=1` is experimental.
+
+### (a) Decode with several streams, tok/s
+
+| Context a stream | Cache | Streams | Batched: total (per stream) | Unbatched: total (per stream) | Greedy = alone |
+|---:|---|---:|---|---|---|
+| 32k | bf16 | 1 | 32.0 | 32.0 | - |
+| 32k | bf16 | 2 | **39.6** (18.1 / 21.5) | 33.3 (15.2 / 18.1) | 2/2 |
+| 32k | bf16 | 4 | **43.0** (10.0-11.9) | 33.0 (7.7-9.1) | 4/4 |
+| 32k | 8-bit | 1 | 31.1 | 31.1 | - |
+| 32k | 8-bit | 2 | **38.6** (17.9 / 20.7) | 32.3 (15.0 / 17.3) | 2/2 |
+| 32k | 8-bit | 4 | **42.6** (9.8-11.7) | 32.6 (7.5-9.0) | 4/4 |
+| 90k (prompts 85.6-86.0k) | bf16 | 4 | **39.9** (9.0-11.6) | 29.4 (6.6-8.6) | 4/4 |
+| 128k (prompts 127.1-127.6k) | 8-bit | 4 | **37.0** (8.3-10.7) | 26.6 (6.0-7.7) | 4/4 |
+| 180k | 8-bit | 4 | pending | pending | pending |
+
+90k is the largest bf16 context for 4 streams, 180k the largest 8-bit one, under this memory rule. Batched verify
+gives +30-31% total at 4 streams at 32k and +36-39% at 90-128k; the greedy check passed in every batched run.
+
+### (b) First token with several streams
+
+| Context a stream | Cache | First token under load, 4 streams (s) | Alone (s) | Prefill alone | Decode alone (tok/s) |
+|---:|---|---|---:|---:|---:|
+| 32k (31.8-32.1k) | bf16 | 43.7 / 87.6 / 131.2 / 174.8 | 43.6-44.0 | about 730 tok/s | 32.0-34.7 |
+| 32k | 8-bit | 44.6 / 89.2 / 133.9 / 179.6 | 44.4-45.3 | about 710 tok/s | 31.1-34.4 |
+| 90k (85.6-86.0k) | bf16 | 133 / 261 / 390 / 521 | 127.5-128.1 | about 671 tok/s | 28.1-30.5 |
+| 128k (127.1-127.6k) | 8-bit | 209 / 417 / 625 / 834 | 202.4-203.3 | about 627 tok/s | 25.3-28.3 |
+| 180k | 8-bit | pending | pending | pending | pending |
+
+Prefill alone = prompt tokens / first-token time alone. Under load, the n-th stream waits for the n-1 prompts
+before it.
+
+### (c) Memory
+
+| Run | Peak wired | Lowest reclaimable |
+|---|---:|---:|
+| 90k bf16, 4 streams, batched | 439.5 GiB | 67.4 GiB |
+| 90k bf16, 4 streams, unbatched | 440.7 GiB | 66.4 GiB |
+| 180k 8-bit, 4 streams | pending | pending |
+
+The memory sampler did not record in the 32k and 128k runs.
+
+### Single stream against context
+
+MTP depth 1 (`GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off`) unless noted; the "default" column is the built-in depth 2
++ 0.7 cut.
+
+| Context | Prefill (first token) | Prose decode, depth 1 | Prose decode, default | Code decode, depth 1 / default | Build |
+|---:|---|---:|---:|---:|---|
+| 1.3k | 736 tok/s (undrafted) | 35.7 | 35.2 | 39.3 / 41.7 | v0.2.1 binary |
+| 4.9k | 786 tok/s (undrafted) | - | - | - | v0.2.1 binary |
+| 16-20k | 755 tok/s at 19.6k (undrafted) | 33.0 at 16k (tf33) | 31.8 at 16k (tf39) | - | v0.2.1 binary / tf33 / tf39 |
+| 39k | 732 tok/s (in-process) | - | - | - | tf39 |
+| 63k | 647 tok/s (98 s) | - | - | - | tf39 |
+| 78k | 677 tok/s (in-process) | - | - | - | tf39 |
+| 128k | 617 tok/s (207 s); 622 tok/s (205 s) in the decode run | 26.0 | 24.4 | 28.0 / 30.9 | v0.2.1 binary |
+| 256k | 534 tok/s (478 s) | 21.3 | 20.3 | - | v0.2.1 binary |
+| 375k (bf16) | 479 tok/s (784 s) | 20.3 | - | - | tf42 |
+| 1M (8-bit) | 270 tok/s (3,802 s) | 9.6 (7.4 without the MTP head) | - | - | tf43 |
+
+First tokens of fresh long prompts are compute-bound: about 650-780 tok/s up to 80k, falling to about 530 tok/s at
+256k and 270 tok/s at 1M, so a 128k prompt takes about 3.5 minutes. Several fresh long prompts queue behind one
+another (the tables above). A follow-up turn in the same conversation does not need to reprocess the whole prompt:
+that is the prompt cache's job (work in progress; it gave about 0.34 s follow-up first tokens on an earlier build,
+but all runs here were measured with it off).
+
 ## Memory
 
 **Peak wired memory 415 GiB at a 77k-token prompt (78k context, `GLM_AX_LOAD_LIMIT_GB=440`); needs about 420 GB of
