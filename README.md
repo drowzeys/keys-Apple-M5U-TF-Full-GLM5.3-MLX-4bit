@@ -87,6 +87,7 @@ off for these runs (`--prompt-cache-gib 0`) so every request is processed from s
 |---|---|---:|---:|---:|---:|---:|
 | **v0.3.1** | `prose` preset: MTP depth 1, floor off | **36.2** | **37.5** | **39.3** | **40.9** | - |
 | **v0.3.1** | `code` preset: built-in default (depth 2 + 0.7 cut) | **36.2** | **36.8** | **41.8** | **42.7** | - |
+| **v0.3.1 release binary** (one-shot run, 2 runs) | `prose` preset | **35.7** | **37.5** | **39.2** | **40.9** | - |
 | v0.3.0 release binary (one-shot run) | `prose` preset | 35.2 | 36.7 | 39.2 | 41.0 | - |
 | v0.2.1 release binary | MTP, depth 1 (`GLM_AX_DRAFT_DEPTH=1 GLM_AX_MTP_FLOOR=off`) | 35.7 | 37.6 | 39.3 | 41.0 | - |
 | v0.2.1 release binary | MTP, built-in default (depth 2 + confidence cut 0.7) | 35.2 | 36.7 | 41.7 | 42.7 | - |
@@ -145,6 +146,10 @@ v0.3.1 (tf48) gate:
 - A greedy essay is byte-identical to the undrafted output with both the `prose` and the `code` preset; Canberra.
 - Needles at 10%, 50% and 90% of about 18k tokens found; with the `long` preset, a needle in a 127,800-token prompt
   found (first token 210.3 s, decode 16.5 tok/s).
+
+v0.3.1 release binary, run through the released `oneshot.sh` (`prose` preset): tarball and binary SHA-256 matched
+the published ones, server up after about 55 s, Canberra, greedy essay byte-identical to undrafted, first token
+0.36 s, decode 35.7 / 37.5 / 39.2 / 40.9 tok/s (prose T=0.6 / T=0 / code / edit, 2 runs).
 
 v0.3.0 release binary: the one-shot `prose` run on the model (Canberra, decode 35.2 / 36.7 / 39.2 / 41.0 tok/s).
 
@@ -484,8 +489,8 @@ has `tensorfold-native` built from this source (`zig build native`, fast mode, Z
 toolchain) as a .tar.gz with its SHA-256, plus the licence files. It needs macOS 27.2.1 or later (the SDK it was
 built with). It is ad-hoc signed, not notarized: after downloading, run
 `xattr -d com.apple.quarantine tensorfold-native`. No weights are included. `oneshot.sh` is attached to the same
-release. The v0.3.1 gate (Results) ran on a build of this exact source; the published file is a rebuild of the same
-source in a neutral folder so that no build path is embedded (see the release notes). The
+release. **The published v0.3.1 binary was verified on the model** through the released `oneshot.sh` (`prose`
+preset; see Results). The
 [v0.1.0](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.1.0-glm53-mtp), [v0.2.0](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.0-glm53-prefill), [v0.2.1](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.2.1-glm53-prefill) and
 [v0.3.0](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/v0.3.0-glm53-1m) releases stay available, with their sources at their tags; those binaries were run
 on the model after publishing.
