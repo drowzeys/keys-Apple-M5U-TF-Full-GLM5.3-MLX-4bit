@@ -29,11 +29,12 @@
 #   5. writes rank 1's folder and moves it to the second Mac file by file over Thunderbolt (~198 GiB);
 #   6. starts rank 1 and rank 0 with mlx.launch (MLX_METAL_FAST_SYNCH=1) and waits for a "Canberra" answer.
 set -u
+set -o pipefail
 
-RELEASE="tp2-v0.1.0"
+RELEASE="tp2-v0.1.1"
 REPO="drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit"
-BUNDLE_NAME="keys-glm53-tp2-macos-arm64-0.1.0.tar.gz"
-BUNDLE_SHA256="89dca1cfc73dd930d10dbdb0b1cf6a8a0478e69f29c25232084e5a15f9b374ba"
+BUNDLE_NAME="keys-glm53-tp2-macos-arm64-0.1.1.tar.gz"
+BUNDLE_SHA256="ae237d9c89812bb7d17b22b9962d7310aad25f3a2fbb9ac9a76019170016bae6"
 PACK_REPO="mlx-community/GLM-5.3-4bit"
 PACK_REV="81ad9b73c6188f808737dbb52458f082d249dcbe"
 HEAD_REPO="inferencerlabs/GLM-5.3-MTP-MLX"
@@ -68,7 +69,7 @@ done
 say() { printf '\n== %s\n' "$*"; }
 info() { printf '   %s\n' "$*"; }
 fail() { printf '   FAILED: %s\n' "$*"; exit 1; }
-run() { printf '   $ %s\n' "$*"; [ "$DRY" -eq 1 ] || eval "$@"; }
+run() { printf '   $ %s\n' "$*"; [ "$DRY" -eq 1 ] && return 0; eval "$@" || fail "this command failed (exit $?): $*"; }
 peer() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" "$@"; }
 LOG="$DIR/logs"; APP="$DIR/app"; VENV="$DIR/venv"; HF="$DIR/hf"; MODEL="$DIR/GLM-5.3-4bit-MTP"; R1="$DIR/rank1"
 HOSTFILE="$DIR/tp2-hostfile.json"
@@ -143,16 +144,23 @@ links() {
     ip=$(ifconfig "$i" 2>/dev/null | awk '/inet 169.254/ {print $2}')
     [ "$s" = PORT_ACTIVE ] && [ -n "$ip" ] || continue
     # the cable's far end: ask the link's IPv6 all-nodes group, then read this port's own neighbour table
-    # (IPv4 cannot do it: every 169.254 address is routed through one port)
-    ping6 -c 2 -i 0.2 "ff02::1%$i" >/dev/null 2>&1
-    own=$(ifconfig "$i" | awk '/ether/ {print $2}')
-    mac=""
-    for m in $(ndp -an -i "$i" 2>/dev/null | awk -v i="$i" '$3==i {print $2}'); do
-      m=$(normmac "$m"); [ "$m" = "$(normmac "$own")" ] && continue
-      echo "$pinfo" | awk '{print $5}' | while read -r pm; do [ "$(normmac "$pm")" = "$m" ] && echo "$pm"; done | head -1 | grep -q . && { mac=$m; break; }
-    done
+    # (IPv4 cannot do it: every 169.254 address is routed through one port). No pipelines with early exits here:
+    # under `set -o pipefail` a `| head -1` makes the whole match fail.
+    own=$(normmac "$(ifconfig "$i" | awk '/ether/ {print $2}')")
     pd=""
-    [ -n "$mac" ] && pd=$(echo "$pinfo" | while read -r a b c e f; do [ "$(normmac "$f")" = "$mac" ] && [ "$c" = PORT_ACTIVE ] && echo "$a $e"; done | head -1)
+    for attempt in 1 2 3; do
+      ping6 -c 2 -i 0.2 "ff02::1%$i" >/dev/null 2>&1 || true
+      neigh=$(ndp -an -i "$i" 2>/dev/null | awk -v i="$i" '$3==i {print $2}')
+      for m in $neigh; do
+        m=$(normmac "$m"); [ "$m" = "$own" ] && continue
+        while read -r a b c e f; do
+          [ -n "$f" ] && [ "$(normmac "$f")" = "$m" ] && [ "$c" = PORT_ACTIVE ] && [ -z "$pd" ] && pd="$a $e"
+        done <<< "$pinfo"
+        [ -n "$pd" ] && break
+      done
+      [ -n "$pd" ] && break
+      sleep 1
+    done
     [ -n "$pd" ] || continue
     echo "$d $ip $pd" >> "$LINKS"
     info "link: here $d ($ip)  <->  second Mac ${pd% *} (${pd#* })"
@@ -204,14 +212,28 @@ install_bundle() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# snapshot REPO REV: print the snapshot folder, reusing a complete copy in your Hugging Face cache
+# (HF_HOME or ~/.cache/huggingface) and downloading into DIR/hf otherwise
+snapshot() {
+  local repo="$1" rev="$2" name hub
+  name="models--$(echo "$repo" | sed 's#/#--#')"
+  for hub in "${HF_HOME:-$HOME/.cache/huggingface}/hub" "$HF/hub"; do
+    if [ -f "$hub/$name/snapshots/$rev/config.json" ] && [ -f "$hub/$name/snapshots/$rev/model.safetensors.index.json" ] && \
+       HF_HUB_OFFLINE=1 HF_HOME="${hub%/hub}" "$VENV/bin/hf" download "$repo" --revision "$rev" --quiet >/dev/null 2>&1; then
+      echo "$hub/$name/snapshots/$rev"; return
+    fi
+  done
+  run "HF_HOME='$HF' '$VENV/bin/hf' download $repo --revision $rev" >&2
+  echo "$HF/hub/$name/snapshots/$rev"
+}
+
 weights() {
   say "4. Weights (first Mac only)"
-  local hf="$VENV/bin/hf"
-  run "HF_HOME='$HF' '$hf' download $PACK_REPO --revision $PACK_REV"
-  PACK="$HF/hub/models--mlx-community--GLM-5.3-4bit/snapshots/$PACK_REV"
+  PACK="$(snapshot "$PACK_REPO" "$PACK_REV")"
+  info "4-bit pack: $PACK"
   if [ "$MTP" -eq 1 ]; then
-    run "HF_HOME='$HF' '$hf' download $HEAD_REPO --revision $HEAD_REV"
-    local head="$HF/hub/models--inferencerlabs--GLM-5.3-MTP-MLX/snapshots/$HEAD_REV"
+    local head; head="$(snapshot "$HEAD_REPO" "$HEAD_REV")"
+    info "MTP layer: $head"
     if [ -f "$MODEL/config.json" ] && grep -q '"num_nextn_predict_layers": 1' "$MODEL/config.json"; then
       info "merged MTP folder already there: $MODEL"
     else
@@ -248,9 +270,13 @@ EOF
   if [ "$YES" -eq 0 ] && [ "$DRY" -eq 0 ] && [ -t 0 ]; then
     local ans; read -r -p "   Start the server now? [Y/n] " ans; case "$ans" in n|N|no) exit 0 ;; esac
   fi
+  # shared secret for the ranks' control channel (same file on both Macs, owner-only)
+  local secret="$DIR/tp2-secret"
+  run "[ -f '$secret' ] || (umask 077; openssl rand -hex 32 > '$secret')"
+  run "scp -q -p -o BatchMode=yes '$secret' '$PEER_TB:$secret' && ssh -o BatchMode=yes '$PEER_TB' chmod 600 '$secret'"
   run "nohup '$VENV/bin/mlx.launch' --backend jaccl --hostfile '$HOSTFILE' --cwd '$DIR' --python '$VENV/bin/python' \
     --env MLX_METAL_FAST_SYNCH=1 --env PYTHONUNBUFFERED=1 -- '$APP/tp2/server.py' --rank0 '$MODEL' --rank1 '$R1' \
-    --host $HOST --port $PORT --max-context $MAXCTX $m $k > '$LOG/server.log' 2>&1 &"
+    --host $HOST --port $PORT --max-context $MAXCTX --secret-file '$secret' $m $k > '$LOG/server.log' 2>&1 &"
   [ "$DRY" -eq 1 ] && return
   info "waiting for the server (loading ~200 GiB on each Mac, about a minute)"
   for i in $(seq 1 240); do

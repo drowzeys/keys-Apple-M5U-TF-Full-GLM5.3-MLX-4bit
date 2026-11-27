@@ -19,7 +19,8 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 - One stream at a time (`--parallel 1`) by default.
 
 **Two ways to run it:** one 512 GB Mac → [`oneshot.sh`](#one-shot) (TensorFold); two 256 GB Macs →
-[`tp2/oneshot-tp2.sh`](#two-256-gb-macs-tp2) (MLX, tensor parallel over Thunderbolt 5).
+[`tp2/oneshot-tp2.sh`](#two-256-gb-macs-tp2) (MLX, tensor parallel over Thunderbolt 5; release
+[tp2-v0.1.1](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/tp2-v0.1.1)).
 
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
@@ -63,12 +64,10 @@ Safety:
 
 ## Two 256 GB Macs (TP=2)
 
-> **Known issue in 0.1.0:** step 5 of `oneshot-tp2.sh` (pre-shard) fails with an rsync error
-> (`BatchMode=yes: (l)stat: No such file or directory`), and the server then cannot start. A fixed 0.1.1 is being
-> tested. Workaround: in `tp2/preshard.py` (line 57), the `TP2_SINK` command is built with `" ".join([...])`, and
-> `glm_tp/model.py` splits it again with `shlex.split`, so the `-e` value `ssh -o BatchMode=yes` falls apart into
-> three arguments. Build it with `shlex.join([...])` instead (same list) so that value stays one argument, then rerun
-> the one-shot.
+Current release: **[tp2-v0.1.1](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/tp2-v0.1.1)**.
+
+> **Known issue in 0.1.0 (pre-shard rsync error in step 5 of `oneshot-tp2.sh`): fixed in tp2-v0.1.1; 0.1.0 is
+> superseded.**
 
 Instead of one 512 GB Mac, GLM-5.3 can run on **two 256 GB M5 Ultra Macs** joined by Thunderbolt 5 cables, split
 tensor-parallel (TP=2) on [MLX](https://github.com/ml-explore/mlx): each Mac holds half of every layer (half the
@@ -148,9 +147,10 @@ request at a time.
   about 300k tokens in total with the bf16 cache, ~1.65x that with `--kv8`.
 - Both Macs must be the same macOS/Python setup (the bundle takes care of Python) and stay cabled; if one rank
   exits, restart both (`--stop`, then run again).
-- Rank 0's control port (5470, rank 1 connects to it) listens on all network interfaces and has no
-  authentication: run it on a trusted network or block that port in the firewall for anything but the
-  Thunderbolt link.
+- Rank 0's control port (5470, rank 1 connects to it) listens on rank 0's Thunderbolt link-local address only,
+  and a connecting peer must answer an HMAC-SHA256 challenge with the shared secret the one-shot writes to
+  `DIR/tp2-secret` on both Macs (owner-only). The HTTP port binds to 127.0.0.1 unless `--host` is given. MLX's
+  own jaccl coordinator port (chosen by `mlx.launch`) is managed by MLX, not by this recipe.
 
 ## Releases
 

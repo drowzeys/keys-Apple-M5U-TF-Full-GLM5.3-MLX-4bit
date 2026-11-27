@@ -39,6 +39,30 @@ def log(*a):
 
 # ---------------------------------------------------------------- control channel (rank 0 -> rank 1)
 
+def ctrl_host():
+    """Rank 0's Thunderbolt link-local address (mlx.launch exports it as the jaccl coordinator)."""
+    return os.environ.get("MLX_JACCL_COORDINATOR", "127.0.0.1:0").rsplit(":", 1)[0]
+
+
+def read_secret(path):
+    if not path:
+        return None
+    st = os.stat(path)
+    if st.st_mode & 0o077:
+        raise SystemExit(f"{path} must be readable by its owner only (chmod 600)")
+    s = Path(path).read_bytes().strip()
+    if len(s) < 32:
+        raise SystemExit(f"{path}: the shared secret must be at least 32 characters")
+    return s
+
+
+def answer_challenge(secret, nonce):
+    import hashlib
+    import hmac
+
+    return hmac.new(secret, b"tp2-ctrl:" + nonce, hashlib.sha256).hexdigest()
+
+
 def send_json(sock, obj):
     data = json.dumps(obj).encode() + b"\n"
     sock.sendall(data)
@@ -149,7 +173,8 @@ class Engine:
 
 
 def follower(engine, args):
-    host = os.environ.get("MLX_JACCL_COORDINATOR", "127.0.0.1:0").split(":")[0]
+    host = ctrl_host()
+    secret = read_secret(args.secret_file)
     for i in range(600):
         try:
             sock = socket.create_connection((host, args.ctrl_port), timeout=10)
@@ -158,8 +183,20 @@ def follower(engine, args):
             time.sleep(1)
     else:
         raise SystemExit(f"rank 1: cannot reach rank 0's control port {host}:{args.ctrl_port}")
+    sock.settimeout(30)
+    f0 = sock.makefile("r")
+    hello = recv_json(f0)                     # {"nonce": hex} when rank 0 asks for the shared secret
+    if hello.get("nonce"):
+        if secret is None:
+            raise SystemExit("rank 0 asks for the shared secret: start rank 1 with --secret-file too")
+        send_json(sock, {"mac": answer_challenge(secret, bytes.fromhex(hello["nonce"]))})
+        if not recv_json(f0).get("ok"):
+            raise SystemExit("rank 0 refused rank 1's shared secret")
+    else:
+        send_json(sock, {"mac": None})
+        recv_json(f0)
     sock.settimeout(None)
-    f = sock.makefile("r")
+    f = f0
     log(f"rank 1: following rank 0 at {host}:{args.ctrl_port}")
     while True:
         req = recv_json(f)
@@ -195,15 +232,45 @@ class Leader:
 
         self.lock = threading.Lock()
         self.jobs = queue.Queue()
+        # The control port listens on the Thunderbolt link-local address only, and with --secret-file a peer
+        # must answer an HMAC-SHA256 challenge before it gets any request.
+        import secrets as _secrets
+        import hmac
+
+        secret = read_secret(args.secret_file)
+        if secret is None:
+            log("warning: no --secret-file: anything that reaches the Thunderbolt address can take rank 1's place")
+        bind = ctrl_host() if args.ctrl_bind == "auto" else args.ctrl_bind
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", args.ctrl_port))
-        srv.listen(1)
-        log(f"rank 0: waiting for rank 1 on control port {args.ctrl_port}")
-        self.peer, _ = srv.accept()
-        self.peer_f = self.peer.makefile("r")
+        srv.bind((bind, args.ctrl_port))
+        srv.listen(4)
+        log(f"rank 0: waiting for rank 1 on {bind}:{args.ctrl_port}")
+        while True:
+            peer, addr = srv.accept()
+            peer.settimeout(30)
+            pf = peer.makefile("r")
+            try:
+                if secret is None:
+                    send_json(peer, {"nonce": None})
+                    recv_json(pf)
+                    send_json(peer, {"ok": True})
+                    break
+                nonce = _secrets.token_bytes(32)
+                send_json(peer, {"nonce": nonce.hex()})
+                mac = recv_json(pf).get("mac") or ""
+                if hmac.compare_digest(mac, answer_challenge(secret, nonce)):
+                    send_json(peer, {"ok": True})
+                    break
+                send_json(peer, {"ok": False})
+                log(f"rank 0: refused a control connection from {addr[0]} (wrong shared secret)")
+            except (OSError, ValueError, ConnectionError) as e:
+                log(f"rank 0: dropped a control connection from {addr[0]}: {e!r}")
+            peer.close()
+        peer.settimeout(None)
+        self.peer, self.peer_f = peer, pf
         srv.close()
-        log("rank 0: rank 1 connected")
+        log(f"rank 0: rank 1 connected from {addr[0]}")
 
     # MLX streams belong to the thread that created them, so every model call runs on the main thread (loop());
     # HTTP threads hand their requests over through a queue and receive text chunks back.
@@ -459,6 +526,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--ctrl-port", type=int, default=5470)
+    ap.add_argument("--ctrl-bind", default="auto", help="control port address (auto = rank 0's Thunderbolt address)")
+    ap.add_argument("--secret-file", help="shared secret (same file on both Macs, chmod 600) for the control channel")
     ap.add_argument("--mtp", action="store_true", help="MTP depth 1 for greedy requests (rank folders written with --mtp)")
     ap.add_argument("--kv8", action="store_true", help="8-bit latent KV cache (57.7 instead of 95.2 KB per token)")
     ap.add_argument("--max-context", type=int, default=131072)

@@ -49,6 +49,17 @@ cp "$HERE/install.sh" "$HERE/RUN.txt" "$B/"
 cp "$ROOT/glm53/tools/merge_mtp_head.py" "$B/tools/"
 find "$B/tp2" -name "__pycache__" -prune -exec rm -rf {} +
 
+if [ -n "${TP2_TEST_PEER:-}" ] && [ -n "${TP2_TEST_MODEL:-}" ]; then
+  # the one-shot's transfer path: preshard.py --to moves files to the second Mac; one layer, then the marker
+  echo "== transfer self-test against $TP2_TEST_PEER"
+  tdir="$WORK/sinktest"; rdir="/tmp/tp2-sinktest-$$"
+  PYTHONPATH= "$WORK/v/bin/python" "$B/tp2/preshard.py" --model "$TP2_TEST_MODEL" --rank 1 --out "$tdir" \
+    --to "$TP2_TEST_PEER:$rdir" --test-layers 1 --chunk-gb 1 || { echo "transfer self-test failed"; exit 1; }
+  ssh -o BatchMode=yes "$TP2_TEST_PEER" "test -f $rdir/tp_shard.json && ls $rdir/model-*.safetensors | wc -l && rm -rf $rdir" \
+    || { echo "transfer self-test: files or marker missing on the peer"; exit 1; }
+  [ -z "$(ls -A "$tdir" 2>/dev/null | grep safetensors)" ] || { echo "transfer self-test: files left behind here"; exit 1; }
+fi
+
 echo "== licences"
 cp "$ROOT/LICENSE" "$ROOT/NOTICE" "$B/"
 cp "$HERE/THIRD_PARTY_NOTICES-tp2.md" "$B/THIRD_PARTY_NOTICES.md"

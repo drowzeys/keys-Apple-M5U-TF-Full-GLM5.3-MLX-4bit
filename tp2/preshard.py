@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--chunk-gb", type=float, default=4.0)
     ap.add_argument("--to", help="rsync destination host:folder; each file is moved there as soon as it is written")
     ap.add_argument("--check", help="load a rank folder strictly on the CPU and report")
+    ap.add_argument("--test-layers", type=int, help=argparse.SUPPRESS)  # write only N layers (transfer self-test)
     a = ap.parse_args()
 
     import mlx.core as mx
@@ -54,17 +55,20 @@ def main():
         ap.error("--model, --rank and --out are required")
     if a.to:
         host, _, folder = a.to.partition(":")
-        os.environ["TP2_SINK"] = " ".join(["rsync", "-a", "--remove-source-files",
-                                           "-e", "ssh -o BatchMode=yes"]) + f" __FILES__ {shlex.quote(a.to.rstrip('/') + '/')}"
-        os.system(f"ssh -o BatchMode=yes {shlex.quote(host)} mkdir -p {shlex.quote(folder)}")
+        # one argument per item: the -e value "ssh -o BatchMode=yes" must stay a single argument
+        os.environ["TP2_SINK"] = shlex.join(["rsync", "-a", "--remove-source-files", "-e", "ssh -o BatchMode=yes",
+                                             "__FILES__", a.to.rstrip("/") + "/"])
+        if os.system(f"ssh -o BatchMode=yes {shlex.quote(host)} mkdir -p {shlex.quote(folder)}") != 0:
+            raise SystemExit(f"cannot create {folder} on {host}")
     fr = [float(v) for v in a.fractions.split(",")]
     hfr = [float(v) for v in a.head_fractions.split(",")]
-    M.write(a.model, a.out, a.rank, 2, a.chunk_gb, None, fr, False, hfr)
+    M.write(a.model, a.out, a.rank, 2, a.chunk_gb, a.test_layers, fr, False, hfr)
     if a.mtp:
         if a.to:  # the main write moved everything; bring the three small metadata files back for the MTP pass
             for f in ("model.safetensors.index.json", "quant_map.json", "tp_shard.json"):
-                os.system(f"rsync -a -e 'ssh -o BatchMode=yes' {shlex.quote(a.to.rstrip('/') + '/' + f)} "
-                          f"{shlex.quote(str(Path(a.out) / f))}")
+                if os.system(f"rsync -a -e 'ssh -o BatchMode=yes' {shlex.quote(a.to.rstrip('/') + '/' + f)} "
+                             f"{shlex.quote(str(Path(a.out) / f))}") != 0:
+                    raise SystemExit(f"cannot fetch {f} back from {a.to}")
         M.write(a.model, a.out, a.rank, 2, a.chunk_gb, None, fr, True, hfr)
 
 
