@@ -63,6 +63,13 @@ Safety:
 
 ## Two 256 GB Macs (TP=2)
 
+> **Known issue in 0.1.0:** step 5 of `oneshot-tp2.sh` (pre-shard) fails with an rsync error
+> (`BatchMode=yes: (l)stat: No such file or directory`), and the server then cannot start. A fixed 0.1.1 is being
+> tested. Workaround: in `tp2/preshard.py` (line 57), the `TP2_SINK` command is built with `" ".join([...])`, and
+> `glm_tp/model.py` splits it again with `shlex.split`, so the `-e` value `ssh -o BatchMode=yes` falls apart into
+> three arguments. Build it with `shlex.join([...])` instead (same list) so that value stays one argument, then rerun
+> the one-shot.
+
 Instead of one 512 GB Mac, GLM-5.3 can run on **two 256 GB M5 Ultra Macs** joined by Thunderbolt 5 cables, split
 tensor-parallel (TP=2) on [MLX](https://github.com/ml-explore/mlx): each Mac holds half of every layer (half the
 attention heads and half of every expert's columns, ~198 GiB), the two halves are summed after each attention and
