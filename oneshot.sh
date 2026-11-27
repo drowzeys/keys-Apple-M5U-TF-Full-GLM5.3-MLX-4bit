@@ -2,6 +2,7 @@
 # One-shot setup and start for full GLM-5.3 (MLX 4-bit) on TensorFold + glm_ax, Apple M5-class Mac.
 #
 #   ./oneshot.sh --preset prose            # check the Mac, fetch binary + weights, start, smoke-test
+#   ./oneshot.sh --preset prose --ablit    # same, with the abliterated 4-bit matrices spliced in
 #   ./oneshot.sh --preset code --dir /Volumes/big/glm53-tf
 #   ./oneshot.sh --preset 1m --dry-run     # print every step and command, change nothing
 #   ./oneshot.sh --status | --stop
@@ -23,6 +24,11 @@ PACK_REPO="mlx-community/GLM-5.3-4bit"
 PACK_REV="81ad9b73c6188f808737dbb52458f082d249dcbe"
 HEAD_REPO="inferencerlabs/GLM-5.3-MTP-MLX"
 HEAD_REV="f1187efee8cf60319a7d782c3488cfd96017c5ce"
+ABLIT_REPO="drowzeys/keys-Ablit-For-GLM-5.3-4bit-MLX"
+ABLIT_REV="33d27f792fdb8bd54abb840bd48d5a963ad51221"
+ABLIT_SHA256="34dc762a2952a3e692951266a0b0527e0efa056f9e3d741d8efed775029b9fd0"
+ABLIT_FILE="model-ablit-l2-49.safetensors"
+ABLIT_DISK_GB=4
 MIN_MACOS="27.2.1"
 MIN_MEM_GB=512
 PACK_DISK_GB=420
@@ -39,10 +45,11 @@ RELEASE="$DEFAULT_RELEASE"
 DRY=0
 YES=0
 FORCE=0
+ABLIT=0
 ACTION="run"
 
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options:
@@ -53,6 +60,8 @@ Options:
                     "latest" takes the newest release and checks its published .sha256 only)
   --port N          server port (default 8020)
   --dry-run         print every step and command; download, write and start nothing
+  --ablit           splice drowzeys/keys-Ablit-For-GLM-5.3-4bit-MLX into the model folder
+                    (the Hugging Face cache is not modified; about 4 GB extra disk)
   --yes             answer yes to the wired-limit question (still runs sudo, which asks for your password)
   --force           continue when a hardware check fails (not recommended)
   --status          show whether the server started by this script is running
@@ -68,6 +77,7 @@ while [ $# -gt 0 ]; do
     --release) RELEASE="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --ablit) ABLIT=1; shift ;;
     --yes) YES=1; shift ;;
     --force) FORCE=1; shift ;;
     --status) ACTION="status"; shift ;;
@@ -303,19 +313,54 @@ merge_script() {
   echo "${DIR}/merge_mtp_head.py"
 }
 
+ablit_script() {
+  local here
+  here="$(cd "$(dirname "$0")" && pwd)"
+  if [ -f "${here}/glm53/tools/apply_ablit.py" ]; then echo "${here}/glm53/tools/apply_ablit.py"; return; fi
+  run curl -fsSL -o "${DIR}/apply_ablit.py" "https://raw.githubusercontent.com/${REPO}/main/glm53/tools/apply_ablit.py" >&2
+  echo "${DIR}/apply_ablit.py"
+}
+
+splice_ablit() {
+  say "3b. Abliteration (drowzeys/keys-Ablit-For-GLM-5.3-4bit-MLX)"
+  info "96 matrices, spliced into clones of the stock shards. The Hugging Face cache is not modified."
+  info "Accept the repo's Responsible Use form once if hf download is rejected: https://huggingface.co/${ABLIT_REPO}"
+  local pack script sha
+  pack="$(get_snapshot "$ABLIT_REPO" "$ABLIT_REV" "$ABLIT_DISK_GB")"
+  if [ "$DRY" -eq 0 ]; then
+    sha="$(shasum -a 256 "${pack}/${ABLIT_FILE}" | awk '{print $1}')"
+    [ "$sha" = "$ABLIT_SHA256" ] || die "ablit pack SHA-256 ${sha} is not the pinned ${ABLIT_SHA256}"
+  fi
+  script="$(ablit_script)"
+  if [ "$MODEL_KIND" = plain ]; then
+    local out="${DIR}/GLM-5.3-4bit-ablit"
+    info "plain preset: writing a private folder ${out} (the cached snapshot stays stock)"
+    run python3 -I "$script" --model "$MODEL" --pack "$pack" --out "$out"
+    MODEL="$out"
+  else
+    run python3 -I "$script" --model "$MODEL" --pack "$pack"
+  fi
+}
+
 fetch_weights() {
   say "3. Weights"
   PACK="$(get_snapshot "$PACK_REPO" "$PACK_REV" "$PACK_DISK_GB")"
-  if [ "$MODEL_KIND" = plain ]; then MODEL="$PACK"; info "model folder: $MODEL (no MTP head)"; return; fi
-  HEADDIR="$(get_snapshot "$HEAD_REPO" "$HEAD_REV" "$HEAD_DISK_GB")"
-  MODEL="${DIR}/GLM-5.3-4bit-MTP"
-  if [ "$DRY" -eq 0 ] && [ -f "${MODEL}/config.json" ] && grep -q '"num_nextn_predict_layers": 1' "${MODEL}/config.json"; then
-    info "merged MTP folder already there: $MODEL"; return
+  if [ "$MODEL_KIND" = plain ]; then
+    MODEL="$PACK"
+    info "model folder: $MODEL (no MTP head)"
+  else
+    HEADDIR="$(get_snapshot "$HEAD_REPO" "$HEAD_REV" "$HEAD_DISK_GB")"
+    MODEL="${DIR}/GLM-5.3-4bit-MTP"
+    if [ "$DRY" -eq 0 ] && [ -f "${MODEL}/config.json" ] && grep -q '"num_nextn_predict_layers": 1' "${MODEL}/config.json"; then
+      info "merged MTP folder already there: $MODEL"
+    else
+      local ms
+      ms="$(merge_script)"
+      info "building the merged MTP folder (symlinks to the pack, no second copy of the weights)"
+      run python3 -I "$ms" merge --base "$PACK" --head "$HEADDIR" --out "$MODEL"
+    fi
   fi
-  local ms
-  ms="$(merge_script)"
-  info "building the merged MTP folder (symlinks to the pack, no second copy of the weights)"
-  run python3 -I "$ms" merge --base "$PACK" --head "$HEADDIR" --out "$MODEL"
+  if [ "$ABLIT" -eq 1 ]; then splice_ablit; fi
 }
 
 # ---------------------------------------------------------------------------------------------------------------

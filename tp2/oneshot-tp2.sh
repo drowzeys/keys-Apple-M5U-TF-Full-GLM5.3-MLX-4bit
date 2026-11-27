@@ -5,6 +5,7 @@
 #
 #   ./oneshot-tp2.sh --peer USER@SECOND_MAC --dry-run     # print every step and command, change nothing
 #   ./oneshot-tp2.sh --peer USER@SECOND_MAC               # check, install, download, pre-shard, start, smoke test
+#   ./oneshot-tp2.sh --peer USER@SECOND_MAC --ablit       # same, with the abliterated matrices spliced before the split
 #   ./oneshot-tp2.sh --peer USER@SECOND_MAC --status      # / --stop
 #
 # Options:
@@ -13,6 +14,8 @@
 #   --release TAG    release to download (default: the pinned one below)
 #   --port N         HTTP port on the first Mac (default 8000; bound to 127.0.0.1 unless --host is given)
 #   --host ADDR      HTTP bind address (default 127.0.0.1)
+#   --ablit          splice drowzeys/keys-Ablit-For-GLM-5.3-4bit-MLX before the TP split
+#                    (about 4 GB; a stock rank-1 folder is rebuilt)
 #   --no-mtp         plain decoding only (no MTP layer download, no MTP slice)
 #   --kv8            8-bit latent KV cache (57.7 instead of 95.2 KB per token: more context and lanes)
 #   --max-context N  (default 131072)
@@ -25,7 +28,8 @@
 #      jaccl hostfile with every link;
 #   3. installs the release bundle (Python 3.11.14 + exact pinned wheels, offline) on both Macs, copying it to
 #      the second Mac over Thunderbolt;
-#   4. downloads the pinned weights on the first Mac (Hugging Face), merges the MTP layer (symlinks, renamed keys);
+#   4. downloads the pinned weights on the first Mac (Hugging Face), merges the MTP layer (symlinks, renamed keys),
+#      and with --ablit splices the abliteration pack into clones of those shards before the split;
 #   5. writes rank 1's folder and moves it to the second Mac file by file over Thunderbolt (~198 GiB);
 #   6. starts rank 1 and rank 0 with mlx.launch (MLX_METAL_FAST_SYNCH=1) and waits for a "Canberra" answer.
 set -u
@@ -39,11 +43,15 @@ PACK_REPO="mlx-community/GLM-5.3-4bit"
 PACK_REV="81ad9b73c6188f808737dbb52458f082d249dcbe"
 HEAD_REPO="inferencerlabs/GLM-5.3-MTP-MLX"
 HEAD_REV="f1187efee8cf60319a7d782c3488cfd96017c5ce"
+ABLIT_REPO="drowzeys/keys-Ablit-For-GLM-5.3-4bit-MLX"
+ABLIT_REV="33d27f792fdb8bd54abb840bd48d5a963ad51221"
+ABLIT_SHA256="34dc762a2952a3e692951266a0b0527e0efa056f9e3d741d8efed775029b9fd0"
+ABLIT_FILE="model-ablit-l2-49.safetensors"
 MIN_MACOS="26.2"   # Thunderbolt RDMA (rdma_ctl, jaccl) and the macOS 26 MLX wheels in the bundle
 MIN_RAM_GB=256
 
 PEER=""; DIR="/Users/Shared/glm53-tp2"; BUNDLE=""; PORT=8000; HOST="127.0.0.1"; MTP=1; KV8=0; MAXCTX=131072
-DRY=0; YES=0; ACTION=run
+DRY=0; YES=0; ABLIT=0; ACTION=run
 while [ $# -gt 0 ]; do
   case "$1" in
     --peer) PEER="$2"; shift ;;
@@ -52,6 +60,7 @@ while [ $# -gt 0 ]; do
     --release) RELEASE="$2"; shift ;;
     --port) PORT="$2"; shift ;;
     --host) HOST="$2"; shift ;;
+    --ablit) ABLIT=1 ;;
     --no-mtp) MTP=0 ;;
     --kv8) KV8=1 ;;
     --max-context) MAXCTX="$2"; shift ;;
@@ -59,7 +68,7 @@ while [ $# -gt 0 ]; do
     --yes|-y) YES=1 ;;
     --status) ACTION=status ;;
     --stop) ACTION=stop ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
   shift
@@ -246,17 +255,54 @@ weights() {
   else
     MODEL="$PACK"
   fi
+  if [ "$ABLIT" -eq 1 ]; then splice_ablit; fi
+}
+
+splice_ablit() {
+  say "4b. Abliteration, before the split"
+  info "Accept https://huggingface.co/${ABLIT_REPO} once if the download is rejected."
+  local pack sha here script
+  pack="$(snapshot "$ABLIT_REPO" "$ABLIT_REV")"
+  if [ "$DRY" -eq 0 ]; then
+    sha="$(shasum -a 256 "${pack}/${ABLIT_FILE}" | awk '{print $1}')"
+    [ "$sha" = "$ABLIT_SHA256" ] || fail "ablit pack SHA-256 ${sha} is not the pinned ${ABLIT_SHA256}"
+  fi
+  here="$(cd "$(dirname "$0")" && pwd)"
+  if [ -f "${here}/../glm53/tools/apply_ablit.py" ]; then script="${here}/../glm53/tools/apply_ablit.py"
+  elif [ -f "${APP}/glm53/tools/apply_ablit.py" ]; then script="${APP}/glm53/tools/apply_ablit.py"
+  else
+    script="${DIR}/apply_ablit.py"
+    run "curl -fsSL -o '$script' 'https://raw.githubusercontent.com/${REPO}/main/glm53/tools/apply_ablit.py'"
+  fi
+  # The merged folder is symlinks. The applier replaces the edited ones with clones.
+  # A plain pack path (no MTP) is the Hugging Face snapshot: write a private folder.
+  if [ "$MTP" -eq 0 ]; then
+    local out="${DIR}/GLM-5.3-4bit-ablit"
+    run "'$VENV/bin/python' -I '$script' --model '$MODEL' --pack '$pack' --out '$out'"
+    MODEL="$out"
+  else
+    run "'$VENV/bin/python' -I '$script' --model '$MODEL' --pack '$pack'"
+  fi
 }
 
 preshard() {
   say "5. Rank 1's folder, written here and moved to the second Mac over Thunderbolt"
+  if [ "$ABLIT" -eq 1 ] && [ "$DRY" -eq 0 ] && ssh -o BatchMode=yes "$PEER_TB" "test -d '$R1'" && \
+     ! ssh -o BatchMode=yes "$PEER_TB" "test -f '$R1/ABLIT.json'"; then
+    info "rank 1 is a stock split; removing it so the abliterated split is written"
+    run "ssh -o BatchMode=yes '$PEER_TB' \"rm -rf '$R1'\""
+  fi
   if [ "$DRY" -eq 0 ] && ssh -o BatchMode=yes "$PEER_TB" "test -f '$R1/tp_shard.json'" && \
-     { [ "$MTP" -eq 0 ] || ssh -o BatchMode=yes "$PEER_TB" "grep -q '\"mtp\": true' '$R1/tp_shard.json'"; }; then
+     { [ "$MTP" -eq 0 ] || ssh -o BatchMode=yes "$PEER_TB" "grep -q '\"mtp\": true' '$R1/tp_shard.json'"; } && \
+     { [ "$ABLIT" -eq 0 ] || ssh -o BatchMode=yes "$PEER_TB" "test -f '$R1/ABLIT.json'"; }; then
     info "rank 1 folder already on the second Mac"; return
   fi
   local m=""; [ "$MTP" -eq 1 ] && m="--mtp"
   run "'$VENV/bin/python' '$APP/tp2/preshard.py' --model '$MODEL' --rank 1 --out '$DIR/rank1-stage' $m --to '$PEER_TB:$R1' 2>&1 | tee '$LOG/preshard.log'"
   run "ssh -o BatchMode=yes '$PEER_TB' \"'$VENV/bin/python' '$APP/tp2/preshard.py' --check '$R1' $m\""
+  if [ "$ABLIT" -eq 1 ]; then
+    run "scp -q -o BatchMode=yes '$MODEL/ABLIT.json' '$PEER_TB:$R1/ABLIT.json'"
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -22,6 +22,10 @@ was adapted from, is listed in [MODIFICATIONS.md](MODIFICATIONS.md).
 [`tp2/oneshot-tp2.sh`](#two-256-gb-macs-tp2) (MLX, tensor parallel over Thunderbolt 5; release
 [tp2-v0.1.1](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/tag/tp2-v0.1.1)).
 
+**Abliterated weights:** add `--ablit` to either one-shot. The pack is
+[drowzeys/keys-Ablit-For-GLM-5.3-4bit-MLX](https://huggingface.co/drowzeys/keys-Ablit-For-GLM-5.3-4bit-MLX).
+An agent should follow [glm53/ABLIT.md](glm53/ABLIT.md) and not improvise a second copy of the 395 GB checkpoint.
+
 It is an experiment, not a release of upstream TensorFold. No container image is provided: Metal does not run
 inside Docker on macOS.
 
@@ -38,8 +42,16 @@ git clone https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit.git
 cd keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit
 ./oneshot.sh --preset prose --dry-run     # print every step and command, change nothing
 ./oneshot.sh --preset prose               # or: code | long | 1m | 1m-nomtp
+./oneshot.sh --preset prose --ablit       # stock folders, abliterated matrices spliced in
 ./oneshot.sh --status                     # / --stop
 ```
+
+`--ablit` downloads the 3.1 GB pack and runs `glm53/tools/apply_ablit.py`. It clones the 48 shards that hold the
+edited matrices (APFS `cp -c`, so the extra disk is the changed bytes, about 3 GB, not another 395 GB) and
+overwrites those ranges. TensorFold reads every tensor in every indexed shard, so the pack is not dropped in as
+an extra file. The Hugging Face cache of `mlx-community/GLM-5.3-4bit` is left stock. The MTP head is not edited.
+Accept the pack's Responsible Use form once if `hf download` is rejected. Details and the measured gate are in
+[glm53/ABLIT.md](glm53/ABLIT.md).
 
 Or without cloning: download `oneshot.sh` from the [latest release](https://github.com/drowzeys/keys-Apple-M5U-TF-Full-GLM5.3-MLX-4bit/releases/latest)
 and run it the same way (it then fetches the merge script from the repository). Large files go under `--dir`
@@ -81,8 +93,13 @@ recipe above.
 # (also in tp2/ of this repository)
 ./oneshot-tp2.sh --peer USER@SECOND_MAC --dry-run     # print every step, change nothing
 ./oneshot-tp2.sh --peer USER@SECOND_MAC               # check, install, download, pre-shard, start, smoke test
+./oneshot-tp2.sh --peer USER@SECOND_MAC --ablit       # splice the ablit pack, then split
 ./oneshot-tp2.sh --peer USER@SECOND_MAC --status      # / --stop
 ```
+
+`--ablit` splices the same pack on the first Mac **before** rank 1's half is written, so both Macs serve the
+abliterated matrices. A rank-1 folder left from a stock run is removed and written again. The Hugging Face cache
+is not modified.
 
 The script checks both Macs (macOS 26.2 or later on both, at least 256 GB, RDMA enabled; it refuses older macOS), finds the Thunderbolt RDMA links and
 writes the hostfile, installs the release bundle `keys-glm53-tp2-macos-arm64-<ver>.tar.gz` (CPython 3.11.14 and every
